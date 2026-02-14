@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::types::FileScope;
-
 #[derive(Parser)]
-#[command(name = "agentfiles", about = "Unified agent file installer")]
+#[command(
+    name = "agentfiles",
+    about = "Unified agent file installer for Claude Code, OpenCode, Codex, and Cursor",
+    version
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -13,16 +15,52 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Install agent files from a manifest or remote git repository
     Install {
+        /// Source: local path, directory, or git URL (e.g., github.com/org/repo@v1.0)
         #[arg(default_value = ".")]
-        path: PathBuf,
-        #[arg(default_value = "project")]
+        source: String,
+
+        /// Installation scope: project or global
+        #[arg(short, long, default_value = "project")]
         scope: String,
+
+        /// Target providers (comma-separated). Defaults to all compatible providers.
+        /// Options: claude-code, opencode, codex, cursor
+        #[arg(short, long, value_delimiter = ',')]
+        providers: Option<Vec<String>>,
+
+        /// File placement strategy: copy or link (symlink). Can be overridden per-file in the manifest.
+        #[arg(long)]
+        strategy: Option<String>,
+
+        /// Project root directory (for project scope installations)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
     },
-    /// Initialize a new agentfiles.json
+
+    /// Initialize a new agentfiles.json manifest
     Init {
         /// Directory to create the manifest in
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Package name (defaults to directory name)
+        #[arg(short, long)]
+        name: Option<String>,
     },
+
+    /// Scan a directory for agent files and generate a manifest
+    Scan {
+        /// Directory to scan
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Write the discovered manifest to agentfiles.json
+        #[arg(short, long)]
+        write: bool,
+    },
+
+    /// Show the provider compatibility matrix
+    Matrix,
 }

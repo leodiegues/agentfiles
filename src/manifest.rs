@@ -1,21 +1,48 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::types::FileKind;
+use crate::types::{FileKind, FileStrategy};
 use anyhow::{Context, Result, bail};
 
+/// A single file mapping in the manifest.
+///
+/// Declares a source file path, its kind (Skill/Agent/Command), and an optional
+/// installation strategy (Copy or Link). The CLI routes this file to the correct
+/// provider directories based on the compatibility matrix.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FileMapping {
+    /// Path to the source file, relative to the manifest location.
     pub path: PathBuf,
+
+    /// What kind of agent file this is.
     pub kind: FileKind,
+
+    /// How to place the file at the target. Defaults to Copy if omitted.
+    #[serde(default, skip_serializing_if = "is_default_strategy")]
+    pub strategy: FileStrategy,
 }
 
+fn is_default_strategy(s: &FileStrategy) -> bool {
+    *s == FileStrategy::Copy
+}
+
+/// The agentfiles.json manifest.
+///
+/// Declares a package of agent files with metadata and a list of file mappings.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub name: String,
     pub version: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+
     pub files: Vec<FileMapping>,
 }
 
@@ -26,6 +53,7 @@ impl Default for Manifest {
             version: "0.0.1".to_string(),
             description: None,
             author: None,
+            repository: None,
             files: vec![],
         }
     }
@@ -52,6 +80,11 @@ impl Manifest {
         self
     }
 
+    pub fn with_repository(mut self, repository: String) -> Self {
+        self.repository = Some(repository);
+        self
+    }
+
     pub fn with_files(mut self, files: Vec<FileMapping>) -> Self {
         self.files = files;
         self
@@ -63,6 +96,9 @@ impl Manifest {
     }
 }
 
+/// Load a manifest from a file path or directory.
+///
+/// If `path` is a directory, looks for `agentfiles.json` inside it.
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
     if path.is_dir() {
         return load_manifest(&path.join("agentfiles.json"));
@@ -71,6 +107,10 @@ pub fn load_manifest(path: &Path) -> Result<Manifest> {
     serde_json::from_str(&content).context("failed to parse manifest file")
 }
 
+/// Save a manifest to a directory as `agentfiles.json`.
+///
+/// Returns the full path of the written file.
+/// Errors if `path` points to an existing file.
 pub fn save_manifest(manifest: &Manifest, path: &Path) -> Result<PathBuf> {
     if path.is_file() {
         bail!("cannot save manifest to a file, provide a directory path.");
@@ -100,12 +140,13 @@ mod tests {
                 "version": "0.1.0",
                 "files": [
                     {
-                        "path": "skill1.py",
+                        "path": "skills/review/SKILL.md",
                         "kind": "Skill"
                     },
                     {
-                        "path": "skill2.py",
-                        "kind": "Skill"
+                        "path": "commands/deploy.md",
+                        "kind": "Command",
+                        "strategy": "Link"
                     }
                 ]
             }"#,
@@ -117,10 +158,38 @@ mod tests {
             assert_eq!(manifest.name, "Test Agent");
             assert_eq!(manifest.version, "0.1.0");
             assert_eq!(manifest.files.len(), 2);
-            assert_eq!(manifest.files[0].path, PathBuf::from("skill1.py"));
+
+            assert_eq!(
+                manifest.files[0].path,
+                PathBuf::from("skills/review/SKILL.md")
+            );
             assert_eq!(manifest.files[0].kind, FileKind::Skill);
-            assert_eq!(manifest.files[1].path, PathBuf::from("skill2.py"));
-            assert_eq!(manifest.files[1].kind, FileKind::Skill);
+            assert_eq!(manifest.files[0].strategy, FileStrategy::Copy); // default
+
+            assert_eq!(manifest.files[1].path, PathBuf::from("commands/deploy.md"));
+            assert_eq!(manifest.files[1].kind, FileKind::Command);
+            assert_eq!(manifest.files[1].strategy, FileStrategy::Link);
+
+            Ok(())
+        }
+
+        #[test]
+        fn load_from_directory_path() -> Result<()> {
+            let dir = TempDir::new().unwrap();
+            let test_file = dir.path().join("agentfiles.json");
+
+            std::fs::write(
+                &test_file,
+                r#"{
+                "name": "Test",
+                "version": "0.1.0",
+                "files": []
+            }"#,
+            )?;
+
+            // Pass the directory, not the file
+            let manifest = load_manifest(dir.path())?;
+            assert_eq!(manifest.name, "Test");
 
             Ok(())
         }
@@ -131,38 +200,44 @@ mod tests {
         use tempfile::TempDir;
 
         #[test]
-        fn save_to_path() -> Result<()> {
+        fn save_and_roundtrip() -> Result<()> {
             let dir = TempDir::new().unwrap();
-            let test_file = dir.path().join("agentfiles.json");
             let manifest = Manifest {
                 name: "Test Agent".to_string(),
                 version: "0.1.0".to_string(),
                 author: Some("Test Author".to_string()),
+                repository: Some("https://github.com/org/repo".to_string()),
                 files: vec![
                     FileMapping {
-                        path: PathBuf::from("skill1.py"),
+                        path: PathBuf::from("skills/review/SKILL.md"),
                         kind: FileKind::Skill,
+                        strategy: FileStrategy::Copy,
                     },
                     FileMapping {
-                        path: PathBuf::from("skill2.py"),
-                        kind: FileKind::Skill,
+                        path: PathBuf::from("commands/deploy.md"),
+                        kind: FileKind::Command,
+                        strategy: FileStrategy::Link,
                     },
                 ],
                 ..Default::default()
             };
 
-            save_manifest(&manifest, &test_file.parent().unwrap())?;
+            save_manifest(&manifest, dir.path())?;
 
-            let saved_manifest = load_manifest(&test_file)?;
+            let loaded = load_manifest(dir.path())?;
 
-            assert_eq!(saved_manifest.author, Some("Test Author".to_string()));
-            assert_eq!(saved_manifest.name, "Test Agent".to_string());
-            assert_eq!(saved_manifest.version, "0.1.0".to_string());
-            assert_eq!(saved_manifest.files.len(), 2);
-            assert_eq!(saved_manifest.files[0].path, PathBuf::from("skill1.py"));
-            assert_eq!(saved_manifest.files[0].kind, FileKind::Skill);
-            assert_eq!(saved_manifest.files[1].path, PathBuf::from("skill2.py"));
-            assert_eq!(saved_manifest.files[1].kind, FileKind::Skill);
+            assert_eq!(loaded.author, Some("Test Author".to_string()));
+            assert_eq!(loaded.name, "Test Agent");
+            assert_eq!(loaded.version, "0.1.0");
+            assert_eq!(
+                loaded.repository,
+                Some("https://github.com/org/repo".to_string())
+            );
+            assert_eq!(loaded.files.len(), 2);
+            assert_eq!(loaded.files[0].kind, FileKind::Skill);
+            assert_eq!(loaded.files[0].strategy, FileStrategy::Copy);
+            assert_eq!(loaded.files[1].kind, FileKind::Command);
+            assert_eq!(loaded.files[1].strategy, FileStrategy::Link);
 
             Ok(())
         }
@@ -171,26 +246,36 @@ mod tests {
         fn save_to_file_error() -> Result<()> {
             let dir = TempDir::new().unwrap();
             let test_file = dir.path().join("agentfiles.json");
+
+            // Create the file first so is_file() returns true
+            std::fs::write(&test_file, "{}")?;
+
+            let manifest = Manifest::default();
+            let result = save_manifest(&manifest, &test_file);
+            assert!(result.is_err());
+
+            Ok(())
+        }
+
+        #[test]
+        fn default_strategy_not_serialized() -> Result<()> {
+            let dir = TempDir::new().unwrap();
             let manifest = Manifest {
-                name: "Test Agent".to_string(),
+                name: "Test".to_string(),
                 version: "0.1.0".to_string(),
-                author: Some("Test Author".to_string()),
-                files: vec![
-                    FileMapping {
-                        path: PathBuf::from("skill1.py"),
-                        kind: FileKind::Skill,
-                    },
-                    FileMapping {
-                        path: PathBuf::from("skill2.py"),
-                        kind: FileKind::Skill,
-                    },
-                ],
+                files: vec![FileMapping {
+                    path: PathBuf::from("skills/test/SKILL.md"),
+                    kind: FileKind::Skill,
+                    strategy: FileStrategy::Copy, // default, should be omitted from JSON
+                }],
                 ..Default::default()
             };
 
-            let result = save_manifest(&manifest, &test_file);
+            save_manifest(&manifest, dir.path())?;
 
-            assert!(result.is_err());
+            let content = std::fs::read_to_string(dir.path().join("agentfiles.json"))?;
+            // The "strategy" key should NOT appear for Copy (the default)
+            assert!(!content.contains("strategy"));
 
             Ok(())
         }
