@@ -51,7 +51,7 @@ pub fn install(
             let target_dir = provider.get_target_dir(scope, &file.kind, project_root)?;
 
             // Determine the target filename/path
-            let target_path = resolve_target_path(&source_path, &file.path, &target_dir)?;
+            let target_path = resolve_target_path(&file.path, &target_dir)?;
 
             // Ensure parent directories exist
             if let Some(parent) = target_path.parent() {
@@ -123,10 +123,10 @@ pub fn install(
             }
 
             results.push(InstallResult {
-                provider: provider.clone(),
+                provider: *provider,
                 source: file.path.display().to_string(),
                 target: target_path.display().to_string(),
-                strategy: file.strategy.clone(),
+                strategy: file.strategy,
                 kind: file.kind.to_string(),
             });
         }
@@ -142,11 +142,7 @@ pub fn install(
 ///
 /// For commands/agents (single .md files), we place the file directly
 /// (e.g., `deploy.md` -> `<target_dir>/deploy.md`).
-fn resolve_target_path(
-    _source_path: &Path,
-    relative_path: &Path,
-    target_dir: &Path,
-) -> Result<std::path::PathBuf> {
+fn resolve_target_path(relative_path: &Path, target_dir: &Path) -> Result<std::path::PathBuf> {
     // Extract the meaningful part of the path.
     // If it's a SKILL.md inside a named directory, keep `<name>/SKILL.md`.
     // If it's a command/agent .md file, keep just the filename.
@@ -167,14 +163,19 @@ fn resolve_target_path(
     }
 }
 
-/// Recursively copy a directory.
+/// Recursively copy a directory, skipping symlinks to avoid infinite loops.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+
+        if file_type.is_symlink() {
+            // Skip symlinks to prevent infinite recursion from directory loops
+            continue;
+        } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path)?;
@@ -284,7 +285,7 @@ mod tests {
 
         let results = install(
             &manifest,
-            &AgentProvider::all(),
+            AgentProvider::ALL,
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),

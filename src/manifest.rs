@@ -115,7 +115,7 @@ pub fn save_manifest(manifest: &Manifest, path: &Path) -> Result<PathBuf> {
     if path.is_file() {
         bail!("cannot save manifest to a file, provide a directory path.");
     }
-    let content = serde_json::to_string_pretty(manifest)?;
+    let content = serde_json::to_string_pretty(manifest)? + "\n";
     let output_path = path.join("agentfiles.json");
     std::fs::write(&output_path, content).context("failed to write manifest")?;
     Ok(output_path)

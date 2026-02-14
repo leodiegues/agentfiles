@@ -208,7 +208,7 @@ fn clone_repo(url: &str, target: &Path) -> Result<()> {
     }
 
     let output = Command::new("git")
-        .args(["clone", "--single-branch", url])
+        .args(["clone", url])
         .arg(target)
         .output()
         .with_context(|| format!("failed to run 'git clone {url}'"))?;
@@ -237,8 +237,30 @@ fn fetch_repo(repo_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate a git ref to prevent flag injection.
+///
+/// Rejects refs that could be interpreted as git command-line flags
+/// or that contain path traversal sequences.
+fn validate_git_ref(git_ref: &str) -> Result<()> {
+    if git_ref.is_empty() {
+        bail!("git ref cannot be empty");
+    }
+    if git_ref.starts_with('-') {
+        bail!("git ref '{git_ref}' looks like a command-line flag — refusing for safety");
+    }
+    if git_ref.contains("..") {
+        bail!("git ref '{git_ref}' contains '..' — refusing for safety");
+    }
+    if git_ref.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        bail!("git ref '{git_ref}' contains whitespace or control characters");
+    }
+    Ok(())
+}
+
 /// Check out a specific ref (branch, tag, or commit hash).
 fn checkout_ref(repo_dir: &Path, git_ref: &str) -> Result<()> {
+    validate_git_ref(git_ref)?;
+
     // First, try a detached checkout (works for tags and commit hashes)
     let output = Command::new("git")
         .args(["checkout", git_ref])
@@ -259,7 +281,7 @@ fn checkout_ref(repo_dir: &Path, git_ref: &str) -> Result<()> {
         .with_context(|| format!("failed to checkout remote branch '{git_ref}'"))?;
 
     if !output2.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output2.stderr);
         bail!("git checkout '{git_ref}' failed:\n{stderr}");
     }
 
@@ -304,10 +326,16 @@ fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
     }
 
     // Reset to match remote and pull latest
-    let _ = Command::new("git")
+    let reset_output = Command::new("git")
         .args(["reset", "--hard", &format!("origin/{default_branch}")])
         .current_dir(repo_dir)
-        .output();
+        .output()
+        .context("failed to run 'git reset'")?;
+
+    if !reset_output.status.success() {
+        let stderr = String::from_utf8_lossy(&reset_output.stderr);
+        eprintln!("warning: git reset --hard failed: {stderr}");
+    }
 
     Ok(())
 }
@@ -444,6 +472,44 @@ mod tests {
         fn cache_dir_under_agentfiles() {
             let dir = get_cache_dir("https://github.com/org/repo").unwrap();
             assert!(dir.to_string_lossy().contains("agentfiles"));
+        }
+    }
+
+    mod validate_git_ref_tests {
+        use super::*;
+
+        #[test]
+        fn accepts_valid_refs() {
+            assert!(validate_git_ref("main").is_ok());
+            assert!(validate_git_ref("v1.0").is_ok());
+            assert!(validate_git_ref("feature/my-branch").is_ok());
+            assert!(validate_git_ref("abc123def").is_ok());
+            assert!(validate_git_ref("release/2.0.0").is_ok());
+        }
+
+        #[test]
+        fn rejects_flag_injection() {
+            assert!(validate_git_ref("--help").is_err());
+            assert!(validate_git_ref("-c").is_err());
+            assert!(validate_git_ref("--upload-pack=evil").is_err());
+        }
+
+        #[test]
+        fn rejects_path_traversal() {
+            assert!(validate_git_ref("../etc/passwd").is_err());
+            assert!(validate_git_ref("foo/../bar").is_err());
+        }
+
+        #[test]
+        fn rejects_empty() {
+            assert!(validate_git_ref("").is_err());
+        }
+
+        #[test]
+        fn rejects_whitespace_and_control_chars() {
+            assert!(validate_git_ref("main branch").is_err());
+            assert!(validate_git_ref("main\tbranch").is_err());
+            assert!(validate_git_ref("main\0branch").is_err());
         }
     }
 
