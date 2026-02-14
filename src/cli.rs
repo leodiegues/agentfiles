@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::types::{AgentProvider, FileScope, FileStrategy};
+
 #[derive(Parser)]
 #[command(
     name = "agentfiles",
@@ -23,16 +25,16 @@ pub enum Command {
 
         /// Installation scope: project or global
         #[arg(short, long, default_value = "project")]
-        scope: String,
+        scope: FileScope,
 
         /// Target providers (comma-separated). Defaults to all compatible providers.
         /// Options: claude-code, opencode, codex, cursor
         #[arg(short, long, value_delimiter = ',')]
-        providers: Option<Vec<String>>,
+        providers: Option<Vec<AgentProvider>>,
 
         /// File placement strategy: copy or link (symlink). Can be overridden per-file in the manifest.
         #[arg(long)]
-        strategy: Option<String>,
+        strategy: Option<FileStrategy>,
 
         /// Project root directory (for project scope installations)
         #[arg(long, default_value = ".")]

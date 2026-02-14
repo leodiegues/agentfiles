@@ -104,12 +104,12 @@ impl AgentProvider {
     /// Used by the scanner to know which directory prefixes to look for
     /// when auto-discovering agent files.
     pub fn project_bases() -> Vec<&'static str> {
-        let mut bases: Vec<&'static str> = AgentProvider::all()
+        let mut seen = std::collections::HashSet::new();
+        AgentProvider::ALL
             .iter()
             .map(|p| p.layout().project_base)
-            .collect();
-        bases.dedup();
-        bases
+            .filter(|b| seen.insert(*b))
+            .collect()
     }
 
     /// Resolves the full target directory for a given scope and file kind.
@@ -200,12 +200,14 @@ mod tests {
         );
 
         // Codex does not support commands or agents
-        assert!(p
-            .get_target_dir(&FileScope::Project, &FileKind::Command, root)
-            .is_err());
-        assert!(p
-            .get_target_dir(&FileScope::Project, &FileKind::Agent, root)
-            .is_err());
+        assert!(
+            p.get_target_dir(&FileScope::Project, &FileKind::Command, root)
+                .is_err()
+        );
+        assert!(
+            p.get_target_dir(&FileScope::Project, &FileKind::Agent, root)
+                .is_err()
+        );
     }
 
     #[test]
@@ -264,7 +266,7 @@ mod tests {
     #[test]
     fn supports_kind_derived_from_layout() {
         // All providers support skills
-        for provider in AgentProvider::all() {
+        for provider in AgentProvider::ALL {
             assert!(provider.supports_kind(&FileKind::Skill));
         }
 

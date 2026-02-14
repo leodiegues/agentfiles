@@ -110,7 +110,7 @@ fn scan_kind_dir(
                         .to_path_buf();
                     mappings.push(FileMapping {
                         path: rel_path,
-                        kind: kind.clone(),
+                        kind: *kind,
                         strategy: FileStrategy::Copy,
                     });
                 }

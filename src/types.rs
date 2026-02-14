@@ -3,7 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Scope determines where files are installed: relative to the project root or globally.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum FileScope {
     Project,
@@ -32,7 +32,7 @@ impl FromStr for FileScope {
 }
 
 /// The kind of agent file. Determines the target subdirectory.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileKind {
     Skill,
     Agent,
@@ -50,7 +50,7 @@ impl fmt::Display for FileKind {
 }
 
 /// How a file is placed at the target location.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FileStrategy {
     #[default]
     Copy,
@@ -79,7 +79,7 @@ impl FromStr for FileStrategy {
 }
 
 /// Supported agentic coding tool providers.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentProvider {
     ClaudeCode,
     OpenCode,
@@ -88,15 +88,13 @@ pub enum AgentProvider {
 }
 
 impl AgentProvider {
-    /// Returns all known providers.
-    pub fn all() -> Vec<AgentProvider> {
-        vec![
-            AgentProvider::ClaudeCode,
-            AgentProvider::OpenCode,
-            AgentProvider::Codex,
-            AgentProvider::Cursor,
-        ]
-    }
+    /// All known providers as a compile-time constant slice.
+    pub const ALL: &[AgentProvider] = &[
+        AgentProvider::ClaudeCode,
+        AgentProvider::OpenCode,
+        AgentProvider::Codex,
+        AgentProvider::Cursor,
+    ];
 }
 
 impl fmt::Display for AgentProvider {
