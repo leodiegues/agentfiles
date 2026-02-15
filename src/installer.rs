@@ -49,11 +49,8 @@ pub fn install(
             }
 
             let target_dir = provider.get_target_dir(scope, &file.kind, project_root)?;
-
-            // Determine the target filename/path
             let target_path = resolve_target_path(&file.path, &target_dir)?;
 
-            // Ensure parent directories exist
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create directory: {}", parent.display()))?;
@@ -75,7 +72,6 @@ pub fn install(
                     }
                 }
                 FileStrategy::Link => {
-                    // Remove existing target if present
                     if target_path.exists() || target_path.is_symlink() {
                         if target_path.is_dir() && !target_path.is_symlink() {
                             fs::remove_dir_all(&target_path)?;
@@ -143,22 +139,17 @@ pub fn install(
 /// For commands/agents (single .md files), we place the file directly
 /// (e.g., `deploy.md` -> `<target_dir>/deploy.md`).
 fn resolve_target_path(relative_path: &Path, target_dir: &Path) -> Result<std::path::PathBuf> {
-    // Extract the meaningful part of the path.
-    // If it's a SKILL.md inside a named directory, keep `<name>/SKILL.md`.
-    // If it's a command/agent .md file, keep just the filename.
     let file_name = relative_path
         .file_name()
         .context("file path has no filename")?;
 
     if file_name == "SKILL.md" {
-        // Skill: keep parent_dir_name/SKILL.md
         let parent_name = relative_path
             .parent()
             .and_then(|p| p.file_name())
             .context("SKILL.md must be inside a named directory")?;
         Ok(target_dir.join(parent_name).join("SKILL.md"))
     } else {
-        // Command or Agent: just the filename
         Ok(target_dir.join(file_name))
     }
 }
