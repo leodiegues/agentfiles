@@ -52,15 +52,11 @@ pub enum Command {
         name: Option<String>,
     },
 
-    /// Scan a directory for agent files and generate a manifest
+    /// Scan a local directory or remote git repository for agent files
     Scan {
-        /// Directory to scan
+        /// Source: local path or git URL (e.g., github.com/org/repo@v1.0)
         #[arg(default_value = ".")]
-        path: PathBuf,
-
-        /// Write the discovered manifest to agentfiles.json
-        #[arg(short, long)]
-        write: bool,
+        source: String,
     },
 
     /// Show the provider compatibility matrix

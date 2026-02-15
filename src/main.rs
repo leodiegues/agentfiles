@@ -14,7 +14,7 @@ fn main() -> Result<()> {
             root,
         } => commands::cmd_install(source, scope, providers, strategy, root),
         cli::Command::Init { path, name } => commands::cmd_init(path, name),
-        cli::Command::Scan { path, write } => commands::cmd_scan(path, write),
+        cli::Command::Scan { source } => commands::cmd_scan(source),
         cli::Command::Matrix => commands::cmd_matrix(),
     }
 }
