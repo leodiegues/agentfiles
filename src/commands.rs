@@ -166,26 +166,33 @@ pub fn cmd_init(path: PathBuf, name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_scan(path: PathBuf, write: bool) -> Result<()> {
-    let files = scanner::scan_agent_files(&path)?;
+pub fn cmd_scan(source: String) -> Result<()> {
+    let files = if git::is_git_url(&source) {
+        let remote = git::parse_remote(&source);
+
+        let ref_display = remote
+            .git_ref
+            .as_deref()
+            .map(|r| format!(" @ {r}"))
+            .unwrap_or_default();
+        println!("Resolving remote: {}{ref_display}", remote.url);
+
+        let git_source = git::resolve_remote(&remote)?;
+        println!("Cached at: {}\n", git_source.local_path.display());
+
+        scanner::scan_agent_files(&git_source.local_path)?
+    } else {
+        scanner::scan_agent_files(&PathBuf::from(&source))?
+    };
 
     if files.is_empty() {
-        println!("No agent files found in {}", path.display());
+        println!("No agent files found in {source}");
         return Ok(());
     }
 
     println!("Found {} agent file(s):\n", files.len());
     for f in &files {
         println!("  [{}] {}", f.kind, f.path.display());
-    }
-
-    if write {
-        let name = scanner::infer_name(&path);
-        let m = manifest::Manifest::default()
-            .with_name(name)
-            .with_files(files);
-        let output = manifest::save_manifest(&m, &path)?;
-        println!("\nWrote manifest to {}", output.display());
     }
 
     Ok(())
@@ -224,4 +231,58 @@ pub fn cmd_matrix() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_skill(dir: &std::path::Path, name: &str) {
+        let skill_dir = dir.join(".claude").join("skills").join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "test skill").unwrap();
+    }
+
+    fn setup_command(dir: &std::path::Path, name: &str) {
+        let cmd_dir = dir.join(".claude").join("commands");
+        fs::create_dir_all(&cmd_dir).unwrap();
+        fs::write(cmd_dir.join(format!("{name}.md")), "test command").unwrap();
+    }
+
+    fn setup_agent(dir: &std::path::Path, name: &str) {
+        let agent_dir = dir.join(".claude").join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join(format!("{name}.md")), "test agent").unwrap();
+    }
+
+    #[test]
+    fn scan_local_with_files() -> Result<()> {
+        let dir = TempDir::new()?;
+        setup_skill(dir.path(), "review");
+        setup_command(dir.path(), "deploy");
+        setup_agent(dir.path(), "security");
+
+        let source = dir.path().to_string_lossy().into_owned();
+        let result = cmd_scan(source);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_local_empty() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        let source = dir.path().to_string_lossy().into_owned();
+        let result = cmd_scan(source);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_local_nonexistent_path() {
+        let result = cmd_scan("/tmp/this-path-definitely-does-not-exist-agentfiles".into());
+        assert!(result.is_err());
+    }
 }
