@@ -14,14 +14,12 @@ pub fn cmd_install(
 ) -> Result<()> {
     let providers = providers.unwrap_or_else(|| AgentProvider::ALL.to_vec());
 
-    // Resolve the source: either a remote git URL or a local path
     let (manifest_dir, mut loaded) = if git::is_git_url(&source) {
         resolve_remote_source(&source)?
     } else {
         resolve_local_source(&source)?
     };
 
-    // Apply strategy override to all files that use the default
     if let Some(strategy) = strategy_override {
         for file in &mut loaded.files {
             if file.strategy == FileStrategy::Copy {
@@ -78,7 +76,6 @@ fn resolve_remote_source(source: &str) -> Result<(PathBuf, manifest::Manifest)> 
 
     println!("Cached at: {}\n", local_path.display());
 
-    // Try to load a manifest; fall back to scanning
     let manifest_path = local_path.join("agentfiles.json");
     let loaded = if manifest_path.is_file() {
         println!("Found agentfiles.json in remote repository.");
@@ -94,7 +91,6 @@ fn resolve_remote_source(source: &str) -> Result<(PathBuf, manifest::Manifest)> 
         }
         println!("Discovered {} agent file(s) via scan.\n", files.len());
 
-        // Build a synthetic manifest from scanned files
         let name = remote
             .url
             .rsplit('/')
@@ -145,7 +141,6 @@ pub fn cmd_init(path: PathBuf, name: Option<String>) -> Result<()> {
         );
     }
 
-    // Try to scan for existing files
     let files = scanner::scan_agent_files(&dir).unwrap_or_default();
 
     let pkg_name = name.unwrap_or_else(|| scanner::infer_name(&dir));

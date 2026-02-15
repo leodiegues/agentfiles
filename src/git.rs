@@ -136,10 +136,6 @@ pub fn get_cache_dir(url: &str) -> Result<PathBuf> {
     Ok(base.join("agentfiles").join(hash))
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
 /// Split a ref suffix from the input.
 ///
 /// The ref delimiter is `@` but only when it appears after a `/` character,
@@ -298,11 +294,9 @@ fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
         .context("failed to determine default branch")?;
 
     let default_branch = if output.status.success() {
-        // Output is like "origin/main" — take just the branch name
         let full = String::from_utf8_lossy(&output.stdout).trim().to_string();
         full.strip_prefix("origin/").unwrap_or(&full).to_string()
     } else {
-        // Fallback: try common default branch names
         "main".to_string()
     };
 
