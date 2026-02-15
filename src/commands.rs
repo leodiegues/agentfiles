@@ -232,3 +232,57 @@ pub fn cmd_matrix() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_skill(dir: &std::path::Path, name: &str) {
+        let skill_dir = dir.join(".claude").join("skills").join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "test skill").unwrap();
+    }
+
+    fn setup_command(dir: &std::path::Path, name: &str) {
+        let cmd_dir = dir.join(".claude").join("commands");
+        fs::create_dir_all(&cmd_dir).unwrap();
+        fs::write(cmd_dir.join(format!("{name}.md")), "test command").unwrap();
+    }
+
+    fn setup_agent(dir: &std::path::Path, name: &str) {
+        let agent_dir = dir.join(".claude").join("agents");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join(format!("{name}.md")), "test agent").unwrap();
+    }
+
+    #[test]
+    fn scan_local_with_files() -> Result<()> {
+        let dir = TempDir::new()?;
+        setup_skill(dir.path(), "review");
+        setup_command(dir.path(), "deploy");
+        setup_agent(dir.path(), "security");
+
+        let source = dir.path().to_string_lossy().into_owned();
+        let result = cmd_scan(source);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_local_empty() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        let source = dir.path().to_string_lossy().into_owned();
+        let result = cmd_scan(source);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_local_nonexistent_path() {
+        let result = cmd_scan("/tmp/this-path-definitely-does-not-exist-agentfiles".into());
+        assert!(result.is_err());
+    }
+}
