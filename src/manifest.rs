@@ -1,37 +1,139 @@
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::types::{FileKind, FileStrategy};
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
-/// A single file mapping in the manifest.
-///
-/// Declares a source file path, its kind (Skill/Agent/Command), and an optional
-/// installation strategy (Copy or Link). The CLI routes this file to the correct
-/// provider directories based on the compatibility matrix.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+use crate::types::{FileKind, FileStrategy};
+
+// ---------------------------------------------------------------------------
+// Internal types (scanner output / installer input)
+// ---------------------------------------------------------------------------
+
+/// A single discovered agent file. Internal type used by the scanner and
+/// installer -- not serialized into the manifest.
+#[derive(Clone, Debug, PartialEq)]
 pub struct FileMapping {
-    /// Path to the source file, relative to the manifest location.
+    /// Path to the source file or directory, relative to the source root.
     pub path: PathBuf,
 
     /// What kind of agent file this is.
     pub kind: FileKind,
 
-    /// How to place the file at the target. Defaults to Copy if omitted.
-    #[serde(default, skip_serializing_if = "is_default_strategy")]
+    /// How to place the file at the target. Defaults to Copy.
     pub strategy: FileStrategy,
 }
 
-fn is_default_strategy(s: &FileStrategy) -> bool {
-    *s == FileStrategy::Copy
+// ---------------------------------------------------------------------------
+// Dependency types (serialized in agentfiles.json)
+// ---------------------------------------------------------------------------
+
+/// A dependency source -- either a simple URL/path string or a detailed spec.
+///
+/// Simple form: `"github.com/org/repo"` or `"github.com/org/repo@v1.0"`
+/// Detailed form: `{ "source": "...", "ref": "v1.0", "pick": [...], ... }`
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum Dependency {
+    Simple(String),
+    Detailed(DependencySpec),
 }
 
-/// The agentfiles.json manifest.
+impl Dependency {
+    /// The source URL or local path for this dependency.
+    pub fn source(&self) -> &str {
+        match self {
+            Dependency::Simple(s) => s,
+            Dependency::Detailed(d) => &d.source,
+        }
+    }
+
+    /// Explicit git ref override, if any. Note that `@ref` in Simple strings
+    /// is handled by git::parse_remote, not here.
+    pub fn git_ref(&self) -> Option<&str> {
+        match self {
+            Dependency::Simple(_) => None,
+            Dependency::Detailed(d) => d.git_ref.as_deref(),
+        }
+    }
+
+    /// Cherry-pick list, if any.
+    pub fn pick(&self) -> Option<&[String]> {
+        match self {
+            Dependency::Simple(_) => None,
+            Dependency::Detailed(d) => d.pick.as_deref(),
+        }
+    }
+
+    /// Per-dependency strategy override, if any.
+    pub fn strategy(&self) -> Option<FileStrategy> {
+        match self {
+            Dependency::Simple(_) => None,
+            Dependency::Detailed(d) => d.strategy,
+        }
+    }
+
+    /// Custom path-to-kind mappings. When set, replaces the default
+    /// `skills/`, `commands/`, `agents/` scanning convention.
+    pub fn paths(&self) -> Option<&[PathMapping]> {
+        match self {
+            Dependency::Simple(_) => None,
+            Dependency::Detailed(d) => d.paths.as_deref(),
+        }
+    }
+}
+
+/// Detailed dependency specification with optional configuration.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DependencySpec {
+    /// Source URL or local path.
+    pub source: String,
+
+    /// Git ref (branch, tag, or commit) to check out.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+
+    /// Cherry-pick specific items by name. Supports kind prefix:
+    /// `"skills/review"`, `"commands/deploy"`, or plain `"review"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pick: Option<Vec<String>>,
+
+    /// Override the installation strategy for all files from this dependency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<FileStrategy>,
+
+    /// Custom directory/file-to-kind mappings. Replaces the default convention
+    /// when specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<PathMapping>>,
+}
+
+/// Maps a custom path in a source repository to a file kind.
 ///
-/// Declares a package of agent files with metadata and a list of file mappings.
+/// If the path resolves to a directory, it is scanned using the standard
+/// convention for that kind (skills = subdirs with SKILL.md, commands/agents
+/// = .md files). If it resolves to a file, that file is installed directly.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PathMapping {
+    /// Relative path within the source repository.
+    pub path: String,
+
+    /// What kind of agent file this path contains.
+    pub kind: FileKind,
+}
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+/// The agentfiles.json project manifest.
+///
+/// Lists dependencies (remote or local sources) that provide agent files.
+/// Similar to package.json -- lives in the consumer's project.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub name: String,
+
+    #[serde(default = "default_version")]
     pub version: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,18 +145,23 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
 
-    pub files: Vec<FileMapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<Dependency>,
+}
+
+fn default_version() -> String {
+    "0.0.1".to_string()
 }
 
 impl Default for Manifest {
     fn default() -> Self {
         Manifest {
             name: "unnamed".to_string(),
-            version: "0.0.1".to_string(),
+            version: default_version(),
             description: None,
             author: None,
             repository: None,
-            files: vec![],
+            dependencies: vec![],
         }
     }
 }
@@ -85,14 +192,25 @@ impl Manifest {
         self
     }
 
-    pub fn with_files(mut self, files: Vec<FileMapping>) -> Self {
-        self.files = files;
+    pub fn with_dependencies(mut self, dependencies: Vec<Dependency>) -> Self {
+        self.dependencies = dependencies;
         self
     }
 
-    pub fn add_file(mut self, file: FileMapping) -> Self {
-        self.files.push(file);
-        self
+    /// Add a dependency if one with the same source doesn't already exist.
+    /// Returns true if the dependency was added, false if it was already present.
+    pub fn add_dependency(&mut self, dep: Dependency) -> bool {
+        let source = dep.source().to_string();
+        if self.has_dependency(&source) {
+            return false;
+        }
+        self.dependencies.push(dep);
+        true
+    }
+
+    /// Check whether a dependency with the given source already exists.
+    pub fn has_dependency(&self, source: &str) -> bool {
+        self.dependencies.iter().any(|d| d.source() == source)
     }
 }
 
@@ -123,160 +241,231 @@ pub fn save_manifest(manifest: &Manifest, path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    mod load_manifest {
+    mod dependency_serialization {
         use super::super::*;
-        use tempfile::TempDir;
 
         #[test]
-        fn load_from_directory() -> Result<()> {
-            let dir = TempDir::new().unwrap();
-            let test_file = dir.path().join("agentfiles.json");
+        fn simple_dependency_roundtrip() -> Result<()> {
+            let dep = Dependency::Simple("github.com/org/repo".to_string());
+            let json = serde_json::to_string(&dep)?;
+            assert_eq!(json, r#""github.com/org/repo""#);
 
-            std::fs::write(
-                &test_file,
-                r#"{
-                "name": "Test Agent",
-                "author": "Test Author",
-                "version": "0.1.0",
-                "files": [
-                    {
-                        "path": "skills/review/SKILL.md",
-                        "kind": "Skill"
-                    },
-                    {
-                        "path": "commands/deploy.md",
-                        "kind": "Command",
-                        "strategy": "Link"
-                    }
-                ]
-            }"#,
-            )?;
-
-            let manifest = load_manifest(&test_file)?;
-
-            assert_eq!(manifest.author, Some("Test Author".to_string()));
-            assert_eq!(manifest.name, "Test Agent");
-            assert_eq!(manifest.version, "0.1.0");
-            assert_eq!(manifest.files.len(), 2);
-
-            assert_eq!(
-                manifest.files[0].path,
-                PathBuf::from("skills/review/SKILL.md")
-            );
-            assert_eq!(manifest.files[0].kind, FileKind::Skill);
-            assert_eq!(manifest.files[0].strategy, FileStrategy::Copy); // default
-
-            assert_eq!(manifest.files[1].path, PathBuf::from("commands/deploy.md"));
-            assert_eq!(manifest.files[1].kind, FileKind::Command);
-            assert_eq!(manifest.files[1].strategy, FileStrategy::Link);
-
+            let parsed: Dependency = serde_json::from_str(&json)?;
+            assert_eq!(parsed, dep);
+            assert_eq!(parsed.source(), "github.com/org/repo");
+            assert_eq!(parsed.git_ref(), None);
+            assert_eq!(parsed.pick(), None);
+            assert_eq!(parsed.strategy(), None);
+            assert_eq!(parsed.paths(), None);
             Ok(())
         }
 
         #[test]
-        fn load_from_directory_path() -> Result<()> {
-            let dir = TempDir::new().unwrap();
-            let test_file = dir.path().join("agentfiles.json");
+        fn detailed_dependency_roundtrip() -> Result<()> {
+            let dep = Dependency::Detailed(DependencySpec {
+                source: "github.com/org/repo".to_string(),
+                git_ref: Some("v2.0".to_string()),
+                pick: Some(vec![
+                    "skills/review".to_string(),
+                    "commands/deploy".to_string(),
+                ]),
+                strategy: Some(FileStrategy::Link),
+                paths: Some(vec![PathMapping {
+                    path: "prompts".to_string(),
+                    kind: FileKind::Skill,
+                }]),
+            });
 
-            std::fs::write(
-                &test_file,
-                r#"{
-                "name": "Test",
-                "version": "0.1.0",
-                "files": []
-            }"#,
-            )?;
+            let json = serde_json::to_string_pretty(&dep)?;
+            let parsed: Dependency = serde_json::from_str(&json)?;
+            assert_eq!(parsed, dep);
 
-            // Pass the directory, not the file
-            let manifest = load_manifest(dir.path())?;
-            assert_eq!(manifest.name, "Test");
+            assert_eq!(parsed.source(), "github.com/org/repo");
+            assert_eq!(parsed.git_ref(), Some("v2.0"));
+            assert_eq!(parsed.pick().unwrap().len(), 2);
+            assert_eq!(parsed.strategy(), Some(FileStrategy::Link));
+            assert_eq!(parsed.paths().unwrap().len(), 1);
+            Ok(())
+        }
 
+        #[test]
+        fn detailed_dependency_minimal() -> Result<()> {
+            let json = r#"{"source": "github.com/org/repo"}"#;
+            let parsed: Dependency = serde_json::from_str(json)?;
+            assert_eq!(parsed.source(), "github.com/org/repo");
+            assert_eq!(parsed.git_ref(), None);
+            assert_eq!(parsed.pick(), None);
+            assert_eq!(parsed.strategy(), None);
+            assert_eq!(parsed.paths(), None);
+            Ok(())
+        }
+
+        #[test]
+        fn ref_field_uses_serde_rename() -> Result<()> {
+            let json = r#"{"source": "github.com/org/repo", "ref": "main"}"#;
+            let parsed: Dependency = serde_json::from_str(json)?;
+            assert_eq!(parsed.git_ref(), Some("main"));
+
+            // Serializes back as "ref", not "git_ref"
+            let serialized = serde_json::to_string(&parsed)?;
+            assert!(serialized.contains(r#""ref":"main""#));
+            assert!(!serialized.contains("git_ref"));
             Ok(())
         }
     }
 
-    mod save_manifest {
+    mod manifest_serialization {
         use super::super::*;
         use tempfile::TempDir;
 
         #[test]
         fn save_and_roundtrip() -> Result<()> {
-            let dir = TempDir::new().unwrap();
+            let dir = TempDir::new()?;
             let manifest = Manifest {
-                name: "Test Agent".to_string(),
+                name: "my-project".to_string(),
                 version: "0.1.0".to_string(),
                 author: Some("Test Author".to_string()),
                 repository: Some("https://github.com/org/repo".to_string()),
-                files: vec![
-                    FileMapping {
-                        path: PathBuf::from("skills/review/SKILL.md"),
-                        kind: FileKind::Skill,
-                        strategy: FileStrategy::Copy,
-                    },
-                    FileMapping {
-                        path: PathBuf::from("commands/deploy.md"),
-                        kind: FileKind::Command,
-                        strategy: FileStrategy::Link,
-                    },
+                dependencies: vec![
+                    Dependency::Simple("github.com/anthropics/skills".to_string()),
+                    Dependency::Detailed(DependencySpec {
+                        source: "github.com/mitsuhiko/agent-stuff".to_string(),
+                        git_ref: Some("main".to_string()),
+                        pick: Some(vec!["skills/commit".to_string()]),
+                        strategy: None,
+                        paths: None,
+                    }),
                 ],
                 ..Default::default()
             };
 
             save_manifest(&manifest, dir.path())?;
-
             let loaded = load_manifest(dir.path())?;
 
-            assert_eq!(loaded.author, Some("Test Author".to_string()));
-            assert_eq!(loaded.name, "Test Agent");
+            assert_eq!(loaded.name, "my-project");
             assert_eq!(loaded.version, "0.1.0");
+            assert_eq!(loaded.author, Some("Test Author".to_string()));
+            assert_eq!(loaded.dependencies.len(), 2);
             assert_eq!(
-                loaded.repository,
-                Some("https://github.com/org/repo".to_string())
+                loaded.dependencies[0].source(),
+                "github.com/anthropics/skills"
             );
-            assert_eq!(loaded.files.len(), 2);
-            assert_eq!(loaded.files[0].kind, FileKind::Skill);
-            assert_eq!(loaded.files[0].strategy, FileStrategy::Copy);
-            assert_eq!(loaded.files[1].kind, FileKind::Command);
-            assert_eq!(loaded.files[1].strategy, FileStrategy::Link);
+            assert_eq!(
+                loaded.dependencies[1].source(),
+                "github.com/mitsuhiko/agent-stuff"
+            );
+            assert_eq!(loaded.dependencies[1].git_ref(), Some("main"));
+            Ok(())
+        }
 
+        #[test]
+        fn empty_dependencies_not_serialized() -> Result<()> {
+            let dir = TempDir::new()?;
+            let manifest = Manifest::default();
+            save_manifest(&manifest, dir.path())?;
+
+            let content = std::fs::read_to_string(dir.path().join("agentfiles.json"))?;
+            assert!(!content.contains("dependencies"));
+            Ok(())
+        }
+
+        #[test]
+        fn load_from_directory_path() -> Result<()> {
+            let dir = TempDir::new()?;
+            std::fs::write(
+                dir.path().join("agentfiles.json"),
+                r#"{"name": "test", "version": "0.1.0"}"#,
+            )?;
+            let manifest = load_manifest(dir.path())?;
+            assert_eq!(manifest.name, "test");
+            assert!(manifest.dependencies.is_empty());
             Ok(())
         }
 
         #[test]
         fn save_to_file_error() -> Result<()> {
-            let dir = TempDir::new().unwrap();
-            let test_file = dir.path().join("agentfiles.json");
-
-            // Create the file first so is_file() returns true
-            std::fs::write(&test_file, "{}")?;
-
-            let manifest = Manifest::default();
-            let result = save_manifest(&manifest, &test_file);
+            let dir = TempDir::new()?;
+            let file = dir.path().join("agentfiles.json");
+            std::fs::write(&file, "{}")?;
+            let result = save_manifest(&Manifest::default(), &file);
             assert!(result.is_err());
+            Ok(())
+        }
+    }
 
+    mod manifest_helpers {
+        use super::super::*;
+
+        #[test]
+        fn add_dependency_deduplicates() {
+            let mut manifest = Manifest::default();
+            let dep = Dependency::Simple("github.com/org/repo".to_string());
+
+            assert!(manifest.add_dependency(dep.clone()));
+            assert!(!manifest.add_dependency(dep));
+            assert_eq!(manifest.dependencies.len(), 1);
+        }
+
+        #[test]
+        fn has_dependency_checks_source() {
+            let mut manifest = Manifest::default();
+            manifest
+                .dependencies
+                .push(Dependency::Simple("github.com/org/repo".to_string()));
+
+            assert!(manifest.has_dependency("github.com/org/repo"));
+            assert!(!manifest.has_dependency("github.com/other/repo"));
+        }
+
+        #[test]
+        fn builder_methods() {
+            let manifest = Manifest::default()
+                .with_name("test".to_string())
+                .with_version("1.0.0".to_string())
+                .with_description("A test project".to_string())
+                .with_author("Author".to_string())
+                .with_repository("https://github.com/test".to_string())
+                .with_dependencies(vec![Dependency::Simple("dep1".to_string())]);
+
+            assert_eq!(manifest.name, "test");
+            assert_eq!(manifest.version, "1.0.0");
+            assert_eq!(manifest.description, Some("A test project".to_string()));
+            assert_eq!(manifest.author, Some("Author".to_string()));
+            assert_eq!(manifest.dependencies.len(), 1);
+        }
+    }
+
+    mod path_mapping {
+        use super::super::*;
+
+        #[test]
+        fn path_mapping_roundtrip() -> Result<()> {
+            let mapping = PathMapping {
+                path: "prompts".to_string(),
+                kind: FileKind::Skill,
+            };
+            let json = serde_json::to_string(&mapping)?;
+            let parsed: PathMapping = serde_json::from_str(&json)?;
+            assert_eq!(parsed, mapping);
             Ok(())
         }
 
         #[test]
-        fn default_strategy_not_serialized() -> Result<()> {
-            let dir = TempDir::new().unwrap();
-            let manifest = Manifest {
-                name: "Test".to_string(),
-                version: "0.1.0".to_string(),
-                files: vec![FileMapping {
-                    path: PathBuf::from("skills/test/SKILL.md"),
-                    kind: FileKind::Skill,
-                    strategy: FileStrategy::Copy, // default, should be omitted from JSON
-                }],
-                ..Default::default()
-            };
-
-            save_manifest(&manifest, dir.path())?;
-
-            let content = std::fs::read_to_string(dir.path().join("agentfiles.json"))?;
-            // The "strategy" key should NOT appear for Copy (the default)
-            assert!(!content.contains("strategy"));
-
+        fn dependency_with_custom_paths() -> Result<()> {
+            let json = r#"{
+                "source": "github.com/some/repo",
+                "paths": [
+                    {"path": "prompts", "kind": "Skill"},
+                    {"path": "macros", "kind": "Command"}
+                ]
+            }"#;
+            let dep: Dependency = serde_json::from_str(json)?;
+            let paths = dep.paths().unwrap();
+            assert_eq!(paths.len(), 2);
+            assert_eq!(paths[0].path, "prompts");
+            assert_eq!(paths[0].kind, FileKind::Skill);
+            assert_eq!(paths[1].path, "macros");
+            assert_eq!(paths[1].kind, FileKind::Command);
             Ok(())
         }
     }

@@ -17,11 +17,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Install agent files from a manifest or remote git repository
+    /// Install agent files from dependencies in agentfiles.json, or add a new source
     Install {
-        /// Source: local path, directory, or git URL (e.g., github.com/org/repo@v1.0)
-        #[arg(default_value = ".")]
-        source: String,
+        /// Source: local path or git URL (e.g., github.com/org/repo@v1.0).
+        /// If omitted, installs all dependencies from agentfiles.json.
+        source: Option<String>,
 
         /// Installation scope: project or global
         #[arg(short, long, default_value = "project")]
@@ -32,9 +32,18 @@ pub enum Command {
         #[arg(short, long, value_delimiter = ',')]
         providers: Option<Vec<AgentProvider>>,
 
-        /// File placement strategy: copy or link (symlink). Can be overridden per-file in the manifest.
+        /// File placement strategy: copy or link (symlink). Can be overridden per-dependency in the manifest.
         #[arg(long)]
         strategy: Option<FileStrategy>,
+
+        /// Cherry-pick specific items by name (comma-separated).
+        /// Supports kind prefix: skills/review, commands/deploy, or plain: review
+        #[arg(long, value_delimiter = ',')]
+        pick: Option<Vec<String>>,
+
+        /// Do not save the source to agentfiles.json after installing
+        #[arg(long)]
+        no_save: bool,
 
         /// Project root directory (for project scope installations)
         #[arg(long, default_value = ".")]
