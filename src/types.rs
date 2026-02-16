@@ -33,6 +33,7 @@ impl FromStr for FileScope {
 
 /// The kind of agent file. Determines the target subdirectory.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
 pub enum FileKind {
     Skill,
     Agent,

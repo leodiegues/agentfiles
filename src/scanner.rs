@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::manifest::FileMapping;
+use crate::manifest::{FileMapping, PathMapping};
 use crate::types::{AgentProvider, FileKind, FileStrategy};
 
 /// Subdirectory names and their corresponding file kind.
@@ -13,28 +13,89 @@ const KIND_DIRS: &[(&str, FileKind)] = &[
     ("agents", FileKind::Agent),
 ];
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Scan a directory for agent files and return discovered file mappings.
 ///
-/// Looks for files under known provider directories (e.g., `.claude/skills/`,
-/// `.opencode/commands/`, `.agents/skills/`) as well as bare `skills/`,
-/// `commands/`, and `agents/` directories at the root.
+/// When `custom_paths` is `None`, uses the default convention: scans
+/// provider-prefixed directories (`.claude/skills/`, `.opencode/commands/`, etc.)
+/// and bare `skills/`, `commands/`, `agents/` directories at the root.
 ///
-/// Skills are expected to be directories containing a `SKILL.md` file.
-/// Commands and agents are expected to be `.md` files directly.
+/// When `custom_paths` is `Some`, only scans the specified paths using their
+/// declared kind. The default convention is entirely replaced.
+///
+/// Skills are directories containing a `SKILL.md` file (the whole directory
+/// is recorded, not just the SKILL.md). Commands and agents are `.md` files.
 ///
 /// The returned `FileMapping` paths are relative to `root`.
-pub fn scan_agent_files(root: &Path) -> Result<Vec<FileMapping>> {
+pub(crate) fn scan_agent_files(
+    root: &Path,
+    custom_paths: Option<&[PathMapping]>,
+) -> Result<Vec<FileMapping>> {
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve path: {}", root.display()))?;
 
     let mut mappings = Vec::new();
 
+    if let Some(paths) = custom_paths {
+        scan_custom_paths(&root, paths, &mut mappings)?;
+    } else {
+        scan_default_convention(&root, &mut mappings)?;
+    }
+
+    deduplicate(&mut mappings);
+
+    Ok(mappings)
+}
+
+/// Filter a list of file mappings by a pick list.
+///
+/// Pick items can be kind-prefixed (`"skills/review"`, `"commands/deploy"`)
+/// or plain names (`"review"`). A plain name matches any kind.
+pub(crate) fn filter_by_pick(mappings: Vec<FileMapping>, pick: &[String]) -> Vec<FileMapping> {
+    mappings
+        .into_iter()
+        .filter(|m| {
+            let name = m.path.file_stem().unwrap_or_default().to_string_lossy();
+
+            pick.iter().any(|p| {
+                if let Some((kind_prefix, pick_name)) = p.split_once('/') {
+                    let kind_matches = match kind_prefix {
+                        "skills" => m.kind == FileKind::Skill,
+                        "commands" => m.kind == FileKind::Command,
+                        "agents" => m.kind == FileKind::Agent,
+                        _ => false,
+                    };
+                    kind_matches && name == pick_name
+                } else {
+                    name == p.as_str()
+                }
+            })
+        })
+        .collect()
+}
+
+/// Infer the folder name from a path to use as a manifest name.
+pub(crate) fn infer_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Default convention scanning
+// ---------------------------------------------------------------------------
+
+/// Scan using the default convention: provider-prefixed dirs + bare kind dirs.
+fn scan_default_convention(root: &Path, mappings: &mut Vec<FileMapping>) -> Result<()> {
     // Scan known provider-prefixed directories (derived from provider layouts)
-    for prefix in AgentProvider::project_bases() {
+    for prefix in AgentProvider::PROJECT_BASES {
         let prefix_dir = root.join(prefix);
         if prefix_dir.is_dir() {
-            scan_kind_dirs(&root, &prefix_dir, &mut mappings)?;
+            scan_kind_dirs(root, &prefix_dir, mappings)?;
         }
     }
 
@@ -42,14 +103,11 @@ pub fn scan_agent_files(root: &Path) -> Result<Vec<FileMapping>> {
     for &(kind_name, ref kind) in KIND_DIRS {
         let kind_dir = root.join(kind_name);
         if kind_dir.is_dir() {
-            scan_kind_dir(&root, &kind_dir, kind, &mut mappings)?;
+            scan_kind_dir(root, &kind_dir, kind, mappings)?;
         }
     }
 
-    // Deduplicate by target filename (keep the first occurrence)
-    deduplicate(&mut mappings);
-
-    Ok(mappings)
+    Ok(())
 }
 
 /// Scan subdirectories inside a provider prefix directory for skills/commands/agents.
@@ -65,8 +123,9 @@ fn scan_kind_dirs(root: &Path, prefix_dir: &Path, mappings: &mut Vec<FileMapping
 
 /// Scan a single kind directory for agent files.
 ///
-/// - Skills: looks for `<name>/SKILL.md` subdirectories
-/// - Commands/Agents: looks for `<name>.md` files
+/// - Skills: looks for `<name>/SKILL.md` subdirectories. Records the directory
+///   path (not the SKILL.md), so the full skill directory is installed.
+/// - Commands/Agents: looks for `<name>.md` files.
 fn scan_kind_dir(
     root: &Path,
     kind_dir: &Path,
@@ -82,13 +141,14 @@ fn scan_kind_dir(
 
         match kind {
             FileKind::Skill => {
-                // Skills are directories containing SKILL.md
+                // Skills are directories containing SKILL.md.
+                // We record the directory path so the entire skill dir is installed.
                 if entry_path.is_dir() {
                     let skill_md = entry_path.join("SKILL.md");
                     if skill_md.is_file() {
-                        let rel_path = skill_md
+                        let rel_path = entry_path
                             .strip_prefix(root)
-                            .unwrap_or(&skill_md)
+                            .unwrap_or(&entry_path)
                             .to_path_buf();
                         mappings.push(FileMapping {
                             path: rel_path,
@@ -121,31 +181,62 @@ fn scan_kind_dir(
     Ok(())
 }
 
-/// Deduplicate file mappings by their filename stem + kind.
+// ---------------------------------------------------------------------------
+// Custom path scanning
+// ---------------------------------------------------------------------------
+
+/// Scan custom path mappings. Each entry maps a relative path to a file kind.
+/// Directories are scanned using the standard kind convention. Files are
+/// added directly.
+fn scan_custom_paths(
+    root: &Path,
+    paths: &[PathMapping],
+    mappings: &mut Vec<FileMapping>,
+) -> Result<()> {
+    for mapping in paths {
+        let full_path = root.join(&mapping.path);
+
+        if !full_path.exists() {
+            // Skip paths that don't exist -- the source may not have all
+            // configured paths.
+            continue;
+        }
+
+        if full_path.is_dir() {
+            // Scan directory using the standard convention for this kind
+            scan_kind_dir(root, &full_path, &mapping.kind, mappings)?;
+        } else if full_path.is_file() {
+            // Single file -- add directly
+            let rel_path = full_path
+                .strip_prefix(root)
+                .unwrap_or(&full_path)
+                .to_path_buf();
+            mappings.push(FileMapping {
+                path: rel_path,
+                kind: mapping.kind,
+                strategy: FileStrategy::Copy,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Deduplication
+// ---------------------------------------------------------------------------
+
+/// Deduplicate file mappings by their name + kind.
 ///
 /// If the same skill/command/agent name appears from multiple provider
 /// directories, keep only the first occurrence.
 fn deduplicate(mappings: &mut Vec<FileMapping>) {
     let mut seen = std::collections::HashSet::new();
     mappings.retain(|m| {
-        let key = format!(
-            "{}:{}",
-            m.kind,
-            m.path
-                .file_stem()
-                .or_else(|| m.path.parent().and_then(|p| p.file_name()))
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
+        let stem = m.path.file_stem().unwrap_or_default().to_string_lossy();
+        let key = format!("{}:{}", m.kind, stem);
         seen.insert(key)
     });
-}
-
-/// Infer the folder name from a path to use as a manifest name.
-pub fn infer_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unnamed".to_string())
 }
 
 #[cfg(test)]
@@ -183,15 +274,21 @@ mod tests {
         .unwrap();
     }
 
+    // -----------------------------------------------------------------------
+    // Default convention tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn scans_claude_skills() -> Result<()> {
         let dir = TempDir::new()?;
         setup_skill(dir.path(), ".claude", "review");
 
-        let mappings = scan_agent_files(dir.path())?;
+        let mappings = scan_agent_files(dir.path(), None)?;
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].kind, FileKind::Skill);
-        assert!(mappings[0].path.ends_with("SKILL.md"));
+        // Should store the directory path, not SKILL.md
+        assert!(mappings[0].path.ends_with("review"));
+        assert!(!mappings[0].path.to_string_lossy().contains("SKILL.md"));
         Ok(())
     }
 
@@ -202,7 +299,7 @@ mod tests {
         setup_command(dir.path(), ".opencode", "deploy");
         setup_agent(dir.path(), ".cursor", "security");
 
-        let mappings = scan_agent_files(dir.path())?;
+        let mappings = scan_agent_files(dir.path(), None)?;
         assert_eq!(mappings.len(), 3);
 
         let kinds: Vec<&FileKind> = mappings.iter().map(|m| &m.kind).collect();
@@ -218,8 +315,7 @@ mod tests {
         setup_skill(dir.path(), ".claude", "review");
         setup_skill(dir.path(), ".opencode", "review");
 
-        let mappings = scan_agent_files(dir.path())?;
-        // Should deduplicate to 1
+        let mappings = scan_agent_files(dir.path(), None)?;
         let skills: Vec<_> = mappings
             .iter()
             .filter(|m| m.kind == FileKind::Skill)
@@ -234,19 +330,210 @@ mod tests {
         // Create bare skills/ directory (not under a provider prefix)
         setup_skill(dir.path(), "", "my-skill");
 
-        let mappings = scan_agent_files(dir.path())?;
+        let mappings = scan_agent_files(dir.path(), None)?;
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].kind, FileKind::Skill);
         Ok(())
     }
 
     #[test]
+    fn skill_stores_directory_path() -> Result<()> {
+        let dir = TempDir::new()?;
+        // Create a skill with extra files alongside SKILL.md
+        let skill_dir = dir.path().join("skills").join("my-skill");
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(skill_dir.join("SKILL.md"), "# My Skill")?;
+        fs::write(skill_dir.join("helper.py"), "# helper script")?;
+        fs::create_dir_all(skill_dir.join("templates"))?;
+        fs::write(skill_dir.join("templates/base.html"), "<html>")?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 1);
+        // The path should be the directory, not SKILL.md
+        assert_eq!(
+            mappings[0].path,
+            std::path::PathBuf::from("skills/my-skill")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn empty_dir_returns_empty() -> Result<()> {
         let dir = TempDir::new()?;
-        let mappings = scan_agent_files(dir.path())?;
+        let mappings = scan_agent_files(dir.path(), None)?;
         assert!(mappings.is_empty());
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Custom path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn custom_paths_scan_directory() -> Result<()> {
+        let dir = TempDir::new()?;
+        // Create skills in a non-standard directory
+        let prompts_dir = dir.path().join("prompts").join("my-skill");
+        fs::create_dir_all(&prompts_dir)?;
+        fs::write(prompts_dir.join("SKILL.md"), "# My Skill")?;
+
+        let custom = vec![PathMapping {
+            path: "prompts".to_string(),
+            kind: FileKind::Skill,
+        }];
+
+        let mappings = scan_agent_files(dir.path(), Some(&custom))?;
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].kind, FileKind::Skill);
+        assert!(mappings[0].path.to_string_lossy().contains("my-skill"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_paths_scan_single_file() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::write(dir.path().join("GUIDELINES.md"), "# Coding Guidelines")?;
+
+        let custom = vec![PathMapping {
+            path: "GUIDELINES.md".to_string(),
+            kind: FileKind::Skill,
+        }];
+
+        let mappings = scan_agent_files(dir.path(), Some(&custom))?;
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].kind, FileKind::Skill);
+        assert_eq!(mappings[0].path, std::path::PathBuf::from("GUIDELINES.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_paths_replaces_defaults() -> Result<()> {
+        let dir = TempDir::new()?;
+        // Create standard skills/ dir AND a custom prompts/ dir
+        setup_skill(dir.path(), "", "standard-skill");
+        let prompts_dir = dir.path().join("prompts").join("custom-skill");
+        fs::create_dir_all(&prompts_dir)?;
+        fs::write(prompts_dir.join("SKILL.md"), "# Custom")?;
+
+        // With custom paths, only prompts/ should be scanned
+        let custom = vec![PathMapping {
+            path: "prompts".to_string(),
+            kind: FileKind::Skill,
+        }];
+
+        let mappings = scan_agent_files(dir.path(), Some(&custom))?;
+        assert_eq!(mappings.len(), 1);
+        assert!(mappings[0].path.to_string_lossy().contains("custom-skill"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_paths_skips_missing() -> Result<()> {
+        let dir = TempDir::new()?;
+        let custom = vec![PathMapping {
+            path: "nonexistent".to_string(),
+            kind: FileKind::Skill,
+        }];
+
+        let mappings = scan_agent_files(dir.path(), Some(&custom))?;
+        assert!(mappings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn custom_paths_nested_directory() -> Result<()> {
+        let dir = TempDir::new()?;
+        let nested = dir
+            .path()
+            .join("src")
+            .join("ai")
+            .join("prompts")
+            .join("review");
+        fs::create_dir_all(&nested)?;
+        fs::write(nested.join("SKILL.md"), "# Review")?;
+
+        let custom = vec![PathMapping {
+            path: "src/ai/prompts".to_string(),
+            kind: FileKind::Skill,
+        }];
+
+        let mappings = scan_agent_files(dir.path(), Some(&custom))?;
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].kind, FileKind::Skill);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Pick filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn filter_by_plain_name() {
+        let mappings = vec![
+            FileMapping {
+                path: "skills/review".into(),
+                kind: FileKind::Skill,
+                strategy: FileStrategy::Copy,
+            },
+            FileMapping {
+                path: "skills/deploy".into(),
+                kind: FileKind::Skill,
+                strategy: FileStrategy::Copy,
+            },
+            FileMapping {
+                path: "commands/deploy.md".into(),
+                kind: FileKind::Command,
+                strategy: FileStrategy::Copy,
+            },
+        ];
+
+        let filtered = filter_by_pick(mappings, &["review".to_string()]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].kind, FileKind::Skill);
+    }
+
+    #[test]
+    fn filter_by_kind_prefix() {
+        let mappings = vec![
+            FileMapping {
+                path: "skills/deploy".into(),
+                kind: FileKind::Skill,
+                strategy: FileStrategy::Copy,
+            },
+            FileMapping {
+                path: "commands/deploy.md".into(),
+                kind: FileKind::Command,
+                strategy: FileStrategy::Copy,
+            },
+        ];
+
+        let filtered = filter_by_pick(mappings, &["commands/deploy".to_string()]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].kind, FileKind::Command);
+    }
+
+    #[test]
+    fn filter_plain_name_matches_all_kinds() {
+        let mappings = vec![
+            FileMapping {
+                path: "skills/deploy".into(),
+                kind: FileKind::Skill,
+                strategy: FileStrategy::Copy,
+            },
+            FileMapping {
+                path: "commands/deploy.md".into(),
+                kind: FileKind::Command,
+                strategy: FileStrategy::Copy,
+            },
+        ];
+
+        let filtered = filter_by_pick(mappings, &["deploy".to_string()]);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Infer name
+    // -----------------------------------------------------------------------
 
     #[test]
     fn infer_name_from_path() {

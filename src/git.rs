@@ -1,7 +1,6 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 
@@ -25,6 +24,17 @@ pub struct ParsedRemote {
     pub url: String,
     /// Optional ref (branch, tag, commit) to check out.
     pub git_ref: Option<String>,
+}
+
+/// Normalize a source string for deduplication.
+///
+/// Strips `@ref` suffixes, normalizes URL schemes, and removes trailing `.git`
+/// so that `github.com/org/repo`, `https://github.com/org/repo`, and
+/// `https://github.com/org/repo.git` all compare as equal.
+pub fn normalize_source(input: &str) -> String {
+    let (base, _ref) = strip_ref(input);
+    let url = normalize_url(base);
+    url.trim_end_matches(".git").to_string()
 }
 
 /// Check whether a string looks like a git remote URL rather than a local path.
@@ -175,24 +185,45 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
-/// Hash a URL string to a 16-character hex string.
+/// Hash a URL string to a 16-character hex string using FNV-1a.
+///
+/// Uses a deterministic hash algorithm (FNV-1a 64-bit) so that cache
+/// directory names remain stable across Rust toolchain upgrades.
 fn hash_url(url: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in url.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 /// Verify that `git` is available on the system.
+///
+/// Only runs the actual check once per process; subsequent calls return
+/// the cached result immediately.
 fn ensure_git_available() -> Result<()> {
-    let output = Command::new("git")
-        .arg("--version")
-        .output()
-        .context("'git' is not installed or not in PATH")?;
+    static GIT_CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
 
-    if !output.status.success() {
-        bail!("'git --version' failed — is git installed?");
-    }
-    Ok(())
+    let result = GIT_CHECKED.get_or_init(|| {
+        let output = Command::new("git")
+            .arg("--version")
+            .output()
+            .map_err(|_| "'git' is not installed or not in PATH".to_string())?;
+
+        if !output.status.success() {
+            return Err("'git --version' failed — is git installed?".to_string());
+        }
+        Ok(())
+    });
+
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Clone a repository into the cache directory.
@@ -293,7 +324,7 @@ fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
         .output()
         .context("failed to determine default branch")?;
 
-    let default_branch = if output.status.success() {
+    let mut branch = if output.status.success() {
         let full = String::from_utf8_lossy(&output.stdout).trim().to_string();
         full.strip_prefix("origin/").unwrap_or(&full).to_string()
     } else {
@@ -301,10 +332,10 @@ fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
     };
 
     let output = Command::new("git")
-        .args(["checkout", &default_branch])
+        .args(["checkout", &branch])
         .current_dir(repo_dir)
         .output()
-        .with_context(|| format!("failed to checkout '{default_branch}'"))?;
+        .with_context(|| format!("failed to checkout '{branch}'"))?;
 
     if !output.status.success() {
         // Try "master" as a fallback
@@ -317,11 +348,12 @@ fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
         if !output2.status.success() {
             bail!("could not determine or checkout the default branch");
         }
+        branch = "master".to_string();
     }
 
     // Reset to match remote and pull latest
     let reset_output = Command::new("git")
-        .args(["reset", "--hard", &format!("origin/{default_branch}")])
+        .args(["reset", "--hard", &format!("origin/{branch}")])
         .current_dir(repo_dir)
         .output()
         .context("failed to run 'git reset'")?;
