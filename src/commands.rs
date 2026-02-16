@@ -10,37 +10,51 @@ use crate::{git, installer, manifest, scanner};
 // Install command
 // ---------------------------------------------------------------------------
 
+/// Options for the install command, collected from CLI arguments.
+pub struct InstallOptions {
+    pub source: Option<String>,
+    pub scope: FileScope,
+    pub providers: Option<Vec<AgentProvider>>,
+    pub strategy: Option<FileStrategy>,
+    pub pick: Option<Vec<String>>,
+    pub no_save: bool,
+    pub dry_run: bool,
+    pub root: PathBuf,
+}
+
 /// Install agent files. Two flows:
 ///
 /// - **No source**: reads `agentfiles.json` from the project root and installs
 ///   all dependencies listed there.
 /// - **With source**: resolves the source, scans it for agent files, installs
 ///   them, and (unless `no_save` is set) adds the source to `agentfiles.json`.
-pub fn cmd_install(
-    source: Option<String>,
-    scope: FileScope,
-    providers: Option<Vec<AgentProvider>>,
-    strategy_override: Option<FileStrategy>,
-    pick: Option<Vec<String>>,
-    no_save: bool,
-    root: PathBuf,
-) -> Result<()> {
-    let providers = providers.unwrap_or_else(|| AgentProvider::ALL.to_vec());
+pub fn cmd_install(opts: InstallOptions) -> Result<()> {
+    let providers = opts
+        .providers
+        .unwrap_or_else(|| AgentProvider::ALL.to_vec());
 
-    let project_root = root
+    let project_root = opts
+        .root
         .canonicalize()
         .context("could not resolve project root")?;
 
-    match source {
-        None => install_from_manifest(&project_root, &providers, &scope, strategy_override),
+    match opts.source {
+        None => install_from_manifest(
+            &project_root,
+            &providers,
+            &opts.scope,
+            opts.strategy,
+            opts.dry_run,
+        ),
         Some(src) => install_from_source(
             &src,
             &project_root,
             &providers,
-            &scope,
-            strategy_override,
-            pick.as_deref(),
-            no_save,
+            &opts.scope,
+            opts.strategy,
+            opts.pick.as_deref(),
+            opts.no_save,
+            opts.dry_run,
         ),
     }
 }
@@ -51,6 +65,7 @@ fn install_from_manifest(
     providers: &[AgentProvider],
     scope: &FileScope,
     strategy_override: Option<FileStrategy>,
+    dry_run: bool,
 ) -> Result<()> {
     let manifest_path = project_root.join("agentfiles.json");
     if !manifest_path.is_file() {
@@ -76,16 +91,23 @@ fn install_from_manifest(
     let mut total_results = Vec::new();
 
     for dep in &loaded.dependencies {
-        let dep_results =
-            install_dependency(dep, project_root, providers, scope, strategy_override)?;
+        let dep_results = install_dependency(
+            dep,
+            project_root,
+            providers,
+            scope,
+            strategy_override,
+            dry_run,
+        )?;
         total_results.extend(dep_results);
     }
 
-    print_results(&total_results);
+    print_results(&total_results, dry_run);
     Ok(())
 }
 
 /// Install from a specific source, optionally saving it to agentfiles.json.
+#[allow(clippy::too_many_arguments)]
 fn install_from_source(
     source: &str,
     project_root: &std::path::Path,
@@ -94,8 +116,9 @@ fn install_from_source(
     strategy_override: Option<FileStrategy>,
     pick: Option<&[String]>,
     no_save: bool,
+    dry_run: bool,
 ) -> Result<()> {
-    let (source_dir, mut files) = resolve_source(source)?;
+    let (source_dir, mut files) = resolve_source(source, None)?;
 
     // Apply pick filter
     if let Some(pick_list) = pick {
@@ -105,22 +128,20 @@ fn install_from_source(
         }
     }
 
-    // Apply strategy override
+    // Apply strategy override (CLI flag takes highest precedence)
     if let Some(strategy) = strategy_override {
         for file in &mut files {
-            if file.strategy == FileStrategy::Copy {
-                file.strategy = strategy;
-            }
+            file.strategy = strategy;
         }
     }
 
-    let results = installer::install(&files, providers, scope, project_root, &source_dir)?;
+    let results = installer::install(&files, providers, scope, project_root, &source_dir, dry_run)?;
 
-    if !no_save {
+    if !no_save && !dry_run {
         save_dependency(source, pick, project_root)?;
     }
 
-    print_results(&results);
+    print_results(&results, dry_run);
     Ok(())
 }
 
@@ -131,24 +152,19 @@ fn install_dependency(
     providers: &[AgentProvider],
     scope: &FileScope,
     strategy_override: Option<FileStrategy>,
+    dry_run: bool,
 ) -> Result<Vec<installer::InstallResult>> {
     let source = dep.source();
     println!("  -> {source}");
 
-    let (source_dir, mut files) = resolve_source(source)?;
-
-    // Apply custom path mappings if specified
-    if let Some(custom_paths) = dep.paths() {
-        // Re-scan with custom paths (the initial resolve_source used defaults)
-        files = scanner::scan_agent_files(&source_dir, Some(custom_paths))?;
-    }
+    let (source_dir, mut files) = resolve_source(source, dep.paths())?;
 
     // Apply pick filter
     if let Some(pick_list) = dep.pick() {
         files = scanner::filter_by_pick(files, pick_list);
     }
 
-    // Apply per-dependency strategy, then global override
+    // Apply strategy: dep-level overrides default, CLI overrides everything
     let dep_strategy = dep.strategy();
     for file in &mut files {
         if let Some(strategy) = dep_strategy
@@ -156,9 +172,7 @@ fn install_dependency(
         {
             file.strategy = strategy;
         }
-        if let Some(strategy) = strategy_override
-            && file.strategy == FileStrategy::Copy
-        {
+        if let Some(strategy) = strategy_override {
             file.strategy = strategy;
         }
     }
@@ -168,7 +182,7 @@ fn install_dependency(
         return Ok(vec![]);
     }
 
-    installer::install(&files, providers, scope, project_root, &source_dir)
+    installer::install(&files, providers, scope, project_root, &source_dir, dry_run)
 }
 
 // ---------------------------------------------------------------------------
@@ -176,16 +190,25 @@ fn install_dependency(
 // ---------------------------------------------------------------------------
 
 /// Resolve a source (remote or local) to a local directory and scanned files.
-fn resolve_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
+///
+/// When `custom_paths` is provided, the scanner uses those instead of the
+/// default directory convention.
+fn resolve_source(
+    source: &str,
+    custom_paths: Option<&[manifest::PathMapping]>,
+) -> Result<(PathBuf, Vec<FileMapping>)> {
     if git::is_git_url(source) {
-        resolve_remote_source(source)
+        resolve_remote_source(source, custom_paths)
     } else {
-        resolve_local_source(source)
+        resolve_local_source(source, custom_paths)
     }
 }
 
 /// Clone/fetch a remote git repo and scan for agent files.
-fn resolve_remote_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
+fn resolve_remote_source(
+    source: &str,
+    custom_paths: Option<&[manifest::PathMapping]>,
+) -> Result<(PathBuf, Vec<FileMapping>)> {
     let remote = git::parse_remote(source);
 
     let ref_display = remote
@@ -200,7 +223,7 @@ fn resolve_remote_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
 
     println!("Cached at: {}\n", local_path.display());
 
-    let files = scanner::scan_agent_files(&local_path, None)?;
+    let files = scanner::scan_agent_files(&local_path, custom_paths)?;
     if files.is_empty() {
         anyhow::bail!("no agent files found in {}", git_source.url);
     }
@@ -210,7 +233,10 @@ fn resolve_remote_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
 }
 
 /// Resolve a local path and scan for agent files.
-fn resolve_local_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
+fn resolve_local_source(
+    source: &str,
+    custom_paths: Option<&[manifest::PathMapping]>,
+) -> Result<(PathBuf, Vec<FileMapping>)> {
     let path = PathBuf::from(source);
     if !path.exists() {
         anyhow::bail!("source path not found: {}", path.display());
@@ -224,7 +250,7 @@ fn resolve_local_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
             .unwrap_or_else(|| PathBuf::from("."))
     };
 
-    let files = scanner::scan_agent_files(&dir, None)?;
+    let files = scanner::scan_agent_files(&dir, custom_paths)?;
     if files.is_empty() {
         anyhow::bail!("no agent files found in {}", dir.display());
     }
@@ -240,6 +266,9 @@ fn resolve_local_source(source: &str) -> Result<(PathBuf, Vec<FileMapping>)> {
 // ---------------------------------------------------------------------------
 
 /// Add a dependency to agentfiles.json, creating the file if it doesn't exist.
+///
+/// Normalizes the source URL and extracts any inline `@ref` into the
+/// structured `DependencySpec.git_ref` field.
 fn save_dependency(
     source: &str,
     pick: Option<&[String]>,
@@ -254,16 +283,26 @@ fn save_dependency(
         manifest::Manifest::default().with_name(name)
     };
 
-    let dep = if let Some(pick_list) = pick {
+    // Parse the source to extract any inline @ref and normalize the URL
+    let parsed = git::parse_remote(source);
+    let normalized_source = if git::is_git_url(source) {
+        parsed.url.clone()
+    } else {
+        source.to_string()
+    };
+
+    let has_details = parsed.git_ref.is_some() || pick.is_some();
+
+    let dep = if has_details {
         Dependency::Detailed(manifest::DependencySpec {
-            source: source.to_string(),
-            git_ref: None,
-            pick: Some(pick_list.to_vec()),
+            source: normalized_source,
+            git_ref: parsed.git_ref,
+            pick: pick.map(|p| p.to_vec()),
             strategy: None,
             paths: None,
         })
     } else {
-        Dependency::Simple(source.to_string())
+        Dependency::Simple(normalized_source)
     };
 
     if loaded.add_dependency(dep) {
@@ -280,15 +319,23 @@ fn save_dependency(
 // Output
 // ---------------------------------------------------------------------------
 
-fn print_results(results: &[installer::InstallResult]) {
+fn print_results(results: &[installer::InstallResult], dry_run: bool) {
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+
     if results.is_empty() {
-        println!("No files installed (no compatible provider/kind combinations found).");
+        println!("{prefix}No files installed (no compatible provider/kind combinations found).");
     } else {
-        println!("\nInstalled {} file(s):\n", results.len(),);
+        let verb = if dry_run {
+            "Would install"
+        } else {
+            "Installed"
+        };
+        println!("\n{prefix}{verb} {} file(s):\n", results.len());
         for r in results {
             println!(
-                "  [{:>11}] {} -> {} ({})",
+                "  [{:>11}] [{}] {} -> {} ({})",
                 r.provider.to_string(),
+                r.kind,
                 r.source,
                 r.target,
                 r.strategy
@@ -362,6 +409,159 @@ pub fn cmd_scan(source: String) -> Result<()> {
     println!("Found {} agent file(s):\n", files.len());
     for f in &files {
         println!("  [{}] {}", f.kind, f.path.display());
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Remove command
+// ---------------------------------------------------------------------------
+
+pub fn cmd_remove(
+    source: String,
+    clean: bool,
+    scope: FileScope,
+    providers: Option<Vec<AgentProvider>>,
+    root: PathBuf,
+) -> Result<()> {
+    let project_root = root
+        .canonicalize()
+        .context("could not resolve project root")?;
+
+    let manifest_path = project_root.join("agentfiles.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!("no agentfiles.json found in {}", project_root.display());
+    }
+
+    let mut loaded = manifest::load_manifest(&project_root)?;
+
+    if !loaded.remove_dependency(&source) {
+        anyhow::bail!("dependency '{}' not found in agentfiles.json", source);
+    }
+
+    // Optionally clean installed files
+    if clean {
+        let providers = providers.unwrap_or_else(|| AgentProvider::ALL.to_vec());
+        clean_installed_files(&source, &project_root, &providers, &scope)?;
+    }
+
+    manifest::save_manifest(&loaded, &project_root)?;
+    println!("Removed '{}' from agentfiles.json", source);
+
+    Ok(())
+}
+
+/// Delete installed files for a source from all provider directories.
+fn clean_installed_files(
+    source: &str,
+    project_root: &std::path::Path,
+    providers: &[AgentProvider],
+    scope: &FileScope,
+) -> Result<()> {
+    // Resolve the source to get the file mappings
+    let scan_result = resolve_source(source, None);
+
+    let files = match scan_result {
+        Ok((_, files)) => files,
+        Err(_) => {
+            println!("  (could not resolve source for cleanup — skipping file deletion)");
+            return Ok(());
+        }
+    };
+
+    let mut cleaned = 0;
+    for file in &files {
+        for provider in providers {
+            if !provider.supports_kind(&file.kind) {
+                continue;
+            }
+
+            let target_dir = match provider.get_target_dir(scope, &file.kind, project_root) {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+
+            let file_name = match file.path.file_name() {
+                Some(name) => name,
+                None => continue,
+            };
+
+            let target_path = target_dir.join(file_name);
+            if target_path.exists() || target_path.is_symlink() {
+                if target_path.is_dir() && !target_path.is_symlink() {
+                    std::fs::remove_dir_all(&target_path)
+                        .with_context(|| format!("failed to remove {}", target_path.display()))?;
+                } else {
+                    std::fs::remove_file(&target_path)
+                        .with_context(|| format!("failed to remove {}", target_path.display()))?;
+                }
+                println!("  Removed {}", target_path.display());
+                cleaned += 1;
+            }
+        }
+    }
+
+    if cleaned == 0 {
+        println!("  (no installed files found to clean)");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// List command
+// ---------------------------------------------------------------------------
+
+pub fn cmd_list(root: PathBuf) -> Result<()> {
+    let project_root = root
+        .canonicalize()
+        .context("could not resolve project root")?;
+
+    let manifest_path = project_root.join("agentfiles.json");
+    if !manifest_path.is_file() {
+        println!("No agentfiles.json found. Run 'agentfiles init' to create one.");
+        return Ok(());
+    }
+
+    let loaded = manifest::load_manifest(&project_root)?;
+
+    println!("{} v{}", loaded.name, loaded.version);
+
+    if let Some(desc) = &loaded.description {
+        println!("{desc}");
+    }
+    println!();
+
+    if loaded.dependencies.is_empty() {
+        println!("No dependencies. Add one with 'agentfiles install <source>'.");
+        return Ok(());
+    }
+
+    println!("{} dependency(ies):\n", loaded.dependencies.len());
+    for dep in &loaded.dependencies {
+        let source = dep.source();
+        let mut details = Vec::new();
+
+        if let Some(r) = dep.git_ref() {
+            details.push(format!("ref={r}"));
+        }
+        if let Some(picks) = dep.pick() {
+            details.push(format!("pick=[{}]", picks.join(", ")));
+        }
+        if let Some(strategy) = dep.strategy() {
+            details.push(format!("strategy={strategy}"));
+        }
+        if let Some(paths) = dep.paths() {
+            let path_strs: Vec<&str> = paths.iter().map(|p| p.path.as_str()).collect();
+            details.push(format!("paths=[{}]", path_strs.join(", ")));
+        }
+
+        if details.is_empty() {
+            println!("  {source}");
+        } else {
+            println!("  {source} ({})", details.join(", "));
+        }
     }
 
     Ok(())
@@ -480,15 +680,16 @@ mod tests {
     #[test]
     fn install_no_source_without_manifest_errors() {
         let dir = TempDir::new().unwrap();
-        let result = cmd_install(
-            None,
-            FileScope::Project,
-            None,
-            None,
-            None,
-            false,
-            dir.path().to_path_buf(),
-        );
+        let result = cmd_install(InstallOptions {
+            source: None,
+            scope: FileScope::Project,
+            providers: None,
+            strategy: None,
+            pick: None,
+            no_save: false,
+            dry_run: false,
+            root: dir.path().to_path_buf(),
+        });
         assert!(result.is_err());
     }
 
@@ -499,15 +700,16 @@ mod tests {
         manifest::save_manifest(&manifest, dir.path())?;
 
         // Should succeed but print "no dependencies" message
-        let result = cmd_install(
-            None,
-            FileScope::Project,
-            None,
-            None,
-            None,
-            false,
-            dir.path().to_path_buf(),
-        );
+        let result = cmd_install(InstallOptions {
+            source: None,
+            scope: FileScope::Project,
+            providers: None,
+            strategy: None,
+            pick: None,
+            no_save: false,
+            dry_run: false,
+            root: dir.path().to_path_buf(),
+        });
         assert!(result.is_ok());
         Ok(())
     }
@@ -528,15 +730,16 @@ mod tests {
 
         let source = src_dir.path().to_string_lossy().into_owned();
 
-        cmd_install(
-            Some(source.clone()),
-            FileScope::Project,
-            None,
-            None,
-            None,
-            false, // auto-save on
-            dst_dir.path().to_path_buf(),
-        )?;
+        cmd_install(InstallOptions {
+            source: Some(source.clone()),
+            scope: FileScope::Project,
+            providers: None,
+            strategy: None,
+            pick: None,
+            no_save: false,
+            dry_run: false,
+            root: dst_dir.path().to_path_buf(),
+        })?;
 
         // agentfiles.json should be created in the project root
         let manifest_path = dst_dir.path().join("agentfiles.json");
@@ -559,15 +762,16 @@ mod tests {
 
         let source = src_dir.path().to_string_lossy().into_owned();
 
-        cmd_install(
-            Some(source),
-            FileScope::Project,
-            None,
-            None,
-            None,
-            true, // no-save
-            dst_dir.path().to_path_buf(),
-        )?;
+        cmd_install(InstallOptions {
+            source: Some(source),
+            scope: FileScope::Project,
+            providers: None,
+            strategy: None,
+            pick: None,
+            no_save: true,
+            dry_run: false,
+            root: dst_dir.path().to_path_buf(),
+        })?;
 
         // agentfiles.json should NOT be created
         assert!(!dst_dir.path().join("agentfiles.json").exists());

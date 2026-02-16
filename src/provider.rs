@@ -99,18 +99,11 @@ impl AgentProvider {
             .collect()
     }
 
-    /// Returns the project-scope base directories for all providers.
+    /// Project-scope base directories for all providers (deduplicated).
     ///
     /// Used by the scanner to know which directory prefixes to look for
     /// when auto-discovering agent files.
-    pub fn project_bases() -> Vec<&'static str> {
-        let mut seen = std::collections::HashSet::new();
-        AgentProvider::ALL
-            .iter()
-            .map(|p| p.layout().project_base)
-            .filter(|b| seen.insert(*b))
-            .collect()
-    }
+    pub const PROJECT_BASES: &[&str] = &[".claude", ".opencode", ".agents", ".cursor"];
 
     /// Resolves the full target directory for a given scope and file kind.
     ///
@@ -293,7 +286,7 @@ mod tests {
 
     #[test]
     fn project_bases_contains_all_providers() {
-        let bases = AgentProvider::project_bases();
+        let bases = AgentProvider::PROJECT_BASES;
         assert!(bases.contains(&".claude"));
         assert!(bases.contains(&".opencode"));
         assert!(bases.contains(&".agents"));

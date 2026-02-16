@@ -3,16 +3,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::git;
 use crate::types::{FileKind, FileStrategy};
 
 // ---------------------------------------------------------------------------
 // Internal types (scanner output / installer input)
 // ---------------------------------------------------------------------------
 
-/// A single discovered agent file. Internal type used by the scanner and
-/// installer -- not serialized into the manifest.
+/// A single discovered agent file used by the scanner and installer.
+///
+/// Not serialized into the manifest — this is an in-memory representation
+/// of a file to be installed.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FileMapping {
+pub(crate) struct FileMapping {
     /// Path to the source file or directory, relative to the source root.
     pub path: PathBuf,
 
@@ -47,38 +50,34 @@ impl Dependency {
         }
     }
 
+    /// Returns the detailed spec, if this is a Detailed dependency.
+    pub fn spec(&self) -> Option<&DependencySpec> {
+        match self {
+            Dependency::Simple(_) => None,
+            Dependency::Detailed(d) => Some(d),
+        }
+    }
+
     /// Explicit git ref override, if any. Note that `@ref` in Simple strings
     /// is handled by git::parse_remote, not here.
     pub fn git_ref(&self) -> Option<&str> {
-        match self {
-            Dependency::Simple(_) => None,
-            Dependency::Detailed(d) => d.git_ref.as_deref(),
-        }
+        self.spec().and_then(|d| d.git_ref.as_deref())
     }
 
     /// Cherry-pick list, if any.
     pub fn pick(&self) -> Option<&[String]> {
-        match self {
-            Dependency::Simple(_) => None,
-            Dependency::Detailed(d) => d.pick.as_deref(),
-        }
+        self.spec().and_then(|d| d.pick.as_deref())
     }
 
     /// Per-dependency strategy override, if any.
     pub fn strategy(&self) -> Option<FileStrategy> {
-        match self {
-            Dependency::Simple(_) => None,
-            Dependency::Detailed(d) => d.strategy,
-        }
+        self.spec().and_then(|d| d.strategy)
     }
 
     /// Custom path-to-kind mappings. When set, replaces the default
     /// `skills/`, `commands/`, `agents/` scanning convention.
     pub fn paths(&self) -> Option<&[PathMapping]> {
-        match self {
-            Dependency::Simple(_) => None,
-            Dependency::Detailed(d) => d.paths.as_deref(),
-        }
+        self.spec().and_then(|d| d.paths.as_deref())
     }
 }
 
@@ -209,8 +208,25 @@ impl Manifest {
     }
 
     /// Check whether a dependency with the given source already exists.
+    ///
+    /// Compares using normalized URLs so that `github.com/org/repo` and
+    /// `https://github.com/org/repo.git` are treated as the same source.
     pub fn has_dependency(&self, source: &str) -> bool {
-        self.dependencies.iter().any(|d| d.source() == source)
+        let normalized = git::normalize_source(source);
+        self.dependencies
+            .iter()
+            .any(|d| git::normalize_source(d.source()) == normalized)
+    }
+
+    /// Remove a dependency by source. Returns true if a dependency was removed.
+    ///
+    /// Uses normalized URL comparison, same as `has_dependency`.
+    pub fn remove_dependency(&mut self, source: &str) -> bool {
+        let normalized = git::normalize_source(source);
+        let before = self.dependencies.len();
+        self.dependencies
+            .retain(|d| git::normalize_source(d.source()) != normalized);
+        self.dependencies.len() < before
     }
 }
 
@@ -455,8 +471,8 @@ mod tests {
             let json = r#"{
                 "source": "github.com/some/repo",
                 "paths": [
-                    {"path": "prompts", "kind": "Skill"},
-                    {"path": "macros", "kind": "Command"}
+                    {"path": "prompts", "kind": "skill"},
+                    {"path": "macros", "kind": "command"}
                 ]
             }"#;
             let dep: Dependency = serde_json::from_str(json)?;

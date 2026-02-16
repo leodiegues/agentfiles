@@ -45,6 +45,10 @@ pub enum Command {
         #[arg(long)]
         no_save: bool,
 
+        /// Preview what would be installed without making changes
+        #[arg(long)]
+        dry_run: bool,
+
         /// Project root directory (for project scope installations)
         #[arg(long, default_value = ".")]
         root: PathBuf,
@@ -66,6 +70,35 @@ pub enum Command {
         /// Source: local path or git URL (e.g., github.com/org/repo@v1.0)
         #[arg(default_value = ".")]
         source: String,
+    },
+
+    /// Remove a dependency from agentfiles.json
+    Remove {
+        /// Source to remove (matches by normalized URL)
+        source: String,
+
+        /// Also delete installed files from provider directories
+        #[arg(long)]
+        clean: bool,
+
+        /// Installation scope used when installing (for --clean)
+        #[arg(short, long, default_value = "project")]
+        scope: FileScope,
+
+        /// Target providers to clean (for --clean). Defaults to all.
+        #[arg(short, long, value_delimiter = ',')]
+        providers: Option<Vec<AgentProvider>>,
+
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+
+    /// List dependencies from agentfiles.json
+    List {
+        /// Project root directory
+        #[arg(default_value = ".")]
+        root: PathBuf,
     },
 
     /// Show the provider compatibility matrix

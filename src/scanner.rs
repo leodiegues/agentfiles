@@ -30,7 +30,7 @@ const KIND_DIRS: &[(&str, FileKind)] = &[
 /// is recorded, not just the SKILL.md). Commands and agents are `.md` files.
 ///
 /// The returned `FileMapping` paths are relative to `root`.
-pub fn scan_agent_files(
+pub(crate) fn scan_agent_files(
     root: &Path,
     custom_paths: Option<&[PathMapping]>,
 ) -> Result<Vec<FileMapping>> {
@@ -55,7 +55,7 @@ pub fn scan_agent_files(
 ///
 /// Pick items can be kind-prefixed (`"skills/review"`, `"commands/deploy"`)
 /// or plain names (`"review"`). A plain name matches any kind.
-pub fn filter_by_pick(mappings: Vec<FileMapping>, pick: &[String]) -> Vec<FileMapping> {
+pub(crate) fn filter_by_pick(mappings: Vec<FileMapping>, pick: &[String]) -> Vec<FileMapping> {
     mappings
         .into_iter()
         .filter(|m| {
@@ -79,7 +79,7 @@ pub fn filter_by_pick(mappings: Vec<FileMapping>, pick: &[String]) -> Vec<FileMa
 }
 
 /// Infer the folder name from a path to use as a manifest name.
-pub fn infer_name(path: &Path) -> String {
+pub(crate) fn infer_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".to_string())
@@ -92,7 +92,7 @@ pub fn infer_name(path: &Path) -> String {
 /// Scan using the default convention: provider-prefixed dirs + bare kind dirs.
 fn scan_default_convention(root: &Path, mappings: &mut Vec<FileMapping>) -> Result<()> {
     // Scan known provider-prefixed directories (derived from provider layouts)
-    for prefix in AgentProvider::project_bases() {
+    for prefix in AgentProvider::PROJECT_BASES {
         let prefix_dir = root.join(prefix);
         if prefix_dir.is_dir() {
             scan_kind_dirs(root, &prefix_dir, mappings)?;

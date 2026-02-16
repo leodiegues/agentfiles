@@ -4,16 +4,16 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::manifest::FileMapping;
-use crate::types::{AgentProvider, FileScope, FileStrategy};
+use crate::types::{AgentProvider, FileKind, FileScope, FileStrategy};
 
 /// Result of installing a single file to a single provider.
 #[derive(Debug)]
-pub struct InstallResult {
+pub(crate) struct InstallResult {
     pub provider: AgentProvider,
     pub source: String,
     pub target: String,
     pub strategy: FileStrategy,
-    pub kind: String,
+    pub kind: FileKind,
 }
 
 /// Install all files from a list of file mappings to the specified providers.
@@ -22,13 +22,17 @@ pub struct InstallResult {
 /// provider that supports the file's kind. The `source_root` is the directory
 /// containing the source files (used to resolve relative source paths).
 ///
+/// When `dry_run` is true, resolves target paths and builds `InstallResult`
+/// entries without creating directories or copying/linking files.
+///
 /// Returns a list of `InstallResult` entries describing what was installed.
-pub fn install(
+pub(crate) fn install(
     files: &[FileMapping],
     providers: &[AgentProvider],
     scope: &FileScope,
     project_root: &Path,
     source_root: &Path,
+    dry_run: bool,
 ) -> Result<Vec<InstallResult>> {
     let mut results = Vec::new();
 
@@ -51,68 +55,73 @@ pub fn install(
             let target_dir = provider.get_target_dir(scope, &file.kind, project_root)?;
             let target_path = resolve_target_path(&file.path, &target_dir)?;
 
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-            }
-
-            // Place the file
-            match file.strategy {
-                FileStrategy::Copy => {
-                    if source_path.is_dir() {
-                        copy_dir_recursive(&source_path, &target_path)?;
-                    } else {
-                        fs::copy(&source_path, &target_path).with_context(|| {
-                            format!(
-                                "failed to copy {} -> {}",
-                                source_path.display(),
-                                target_path.display()
-                            )
-                        })?;
-                    }
+            if !dry_run {
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create directory: {}", parent.display())
+                    })?;
                 }
-                FileStrategy::Link => {
-                    if target_path.exists() || target_path.is_symlink() {
-                        if target_path.is_dir() && !target_path.is_symlink() {
-                            fs::remove_dir_all(&target_path)?;
+
+                // Place the file
+                match file.strategy {
+                    FileStrategy::Copy => {
+                        if source_path.is_dir() {
+                            copy_dir_recursive(&source_path, &target_path)?;
                         } else {
-                            fs::remove_file(&target_path)?;
+                            fs::copy(&source_path, &target_path).with_context(|| {
+                                format!(
+                                    "failed to copy {} -> {}",
+                                    source_path.display(),
+                                    target_path.display()
+                                )
+                            })?;
                         }
                     }
+                    FileStrategy::Link => {
+                        if target_path.exists() || target_path.is_symlink() {
+                            if target_path.is_dir() && !target_path.is_symlink() {
+                                fs::remove_dir_all(&target_path)?;
+                            } else {
+                                fs::remove_file(&target_path)?;
+                            }
+                        }
 
-                    let abs_source = source_path.canonicalize().with_context(|| {
-                        format!("failed to resolve absolute path: {}", source_path.display())
-                    })?;
+                        let abs_source = source_path.canonicalize().with_context(|| {
+                            format!("failed to resolve absolute path: {}", source_path.display())
+                        })?;
 
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&abs_source, &target_path).with_context(|| {
-                        format!(
-                            "failed to symlink {} -> {}",
-                            abs_source.display(),
-                            target_path.display()
-                        )
-                    })?;
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&abs_source, &target_path).with_context(
+                            || {
+                                format!(
+                                    "failed to symlink {} -> {}",
+                                    abs_source.display(),
+                                    target_path.display()
+                                )
+                            },
+                        )?;
 
-                    #[cfg(windows)]
-                    {
-                        if abs_source.is_dir() {
-                            std::os::windows::fs::symlink_dir(&abs_source, &target_path)
-                                .with_context(|| {
-                                    format!(
-                                        "failed to symlink {} -> {}",
-                                        abs_source.display(),
-                                        target_path.display()
-                                    )
-                                })?;
-                        } else {
-                            std::os::windows::fs::symlink_file(&abs_source, &target_path)
-                                .with_context(|| {
-                                    format!(
-                                        "failed to symlink {} -> {}",
-                                        abs_source.display(),
-                                        target_path.display()
-                                    )
-                                })?;
+                        #[cfg(windows)]
+                        {
+                            if abs_source.is_dir() {
+                                std::os::windows::fs::symlink_dir(&abs_source, &target_path)
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to symlink {} -> {}",
+                                            abs_source.display(),
+                                            target_path.display()
+                                        )
+                                    })?;
+                            } else {
+                                std::os::windows::fs::symlink_file(&abs_source, &target_path)
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to symlink {} -> {}",
+                                            abs_source.display(),
+                                            target_path.display()
+                                        )
+                                    })?;
+                            }
                         }
                     }
                 }
@@ -123,7 +132,7 @@ pub fn install(
                 source: file.path.display().to_string(),
                 target: target_path.display().to_string(),
                 strategy: file.strategy,
-                kind: file.kind.to_string(),
+                kind: file.kind,
             });
         }
     }
@@ -197,6 +206,7 @@ mod tests {
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),
+            false,
         )?;
 
         assert_eq!(results.len(), 1);
@@ -237,6 +247,7 @@ mod tests {
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),
+            false,
         )?;
 
         // Should only install to ClaudeCode, not Codex
@@ -268,6 +279,7 @@ mod tests {
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),
+            false,
         )?;
 
         // All 4 providers support skills
@@ -325,6 +337,7 @@ mod tests {
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),
+            false,
         )?;
 
         assert_eq!(results.len(), 1);
@@ -360,6 +373,7 @@ mod tests {
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),
+            false,
         )?;
 
         assert_eq!(results.len(), 1);
@@ -389,6 +403,7 @@ mod tests {
             &FileScope::Project,
             dst_dir.path(),
             src_dir.path(),
+            false,
         );
 
         assert!(result.is_err());
