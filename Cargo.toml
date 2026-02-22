@@ -1,6 +1,6 @@
 [package]
 name = "agentfiles"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Unified agent file installer for Claude Code, OpenCode, Codex, and Cursor"
 license = "MIT"
