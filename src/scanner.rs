@@ -191,8 +191,8 @@ fn scan_kind_dir(
                 }
                 if entry_path.is_dir() {
                     debug!("Recursing into {} for {}", entry_path.display(), kind);
+                    scan_kind_dir(root, &entry_path, kind, mappings)?;
                 }
-                scan_kind_dir(root, &entry_path, kind, mappings)?;
             }
         }
     }
