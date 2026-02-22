@@ -11,6 +11,7 @@ use crate::types::{AgentProvider, FileScope, FileStrategy};
     version
 )]
 pub struct Cli {
+    /// Enable debug logging output
     #[arg(short, long, global = true)]
     pub verbose: bool,
 

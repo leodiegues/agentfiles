@@ -67,6 +67,14 @@ The first `install <source>` scans the source for agent files, installs them int
 
 ## Commands
 
+### Global Options
+
+These options can be used with any command:
+
+| Option | Description |
+|---|---|
+| `-v, --verbose` | Enable debug logging output for troubleshooting |
+
 ### `agentfiles init`
 
 Create a new `agentfiles.json` manifest. The manifest starts empty -- add dependencies with `agentfiles install <source>`.
@@ -173,6 +181,9 @@ agentfiles scan
 
 # Scan a remote repository
 agentfiles scan github.com/org/repo@main
+
+# Scan with verbose output for troubleshooting
+agentfiles --verbose scan github.com/org/repo
 ```
 
 ### `agentfiles list`
