@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use log::debug;
 
 use crate::manifest::FileMapping;
 use crate::types::{AgentProvider, FileKind, FileScope, FileStrategy};
@@ -34,12 +35,25 @@ pub(crate) fn install(
     source_root: &Path,
     dry_run: bool,
 ) -> Result<Vec<InstallResult>> {
+    debug!(
+        "Installing {} file(s) to {} provider(s) (dry_run={})",
+        files.len(),
+        providers.len(),
+        dry_run
+    );
     let mut results = Vec::new();
 
     for file in files {
         let source_path = source_root.join(&file.path);
+        debug!(
+            "Processing: {} ({}, {})",
+            file.path.display(),
+            file.kind,
+            file.strategy
+        );
 
         if !source_path.exists() {
+            debug!("Source file not found: {}", source_path.display());
             anyhow::bail!(
                 "source file not found: {} (resolved to {})",
                 file.path.display(),
@@ -49,11 +63,23 @@ pub(crate) fn install(
 
         for provider in providers {
             if !provider.supports_kind(&file.kind) {
+                debug!(
+                    "Skipping {} for provider {} (unsupported {})",
+                    file.path.display(),
+                    provider,
+                    file.kind
+                );
                 continue;
             }
 
             let target_dir = provider.get_target_dir(scope, &file.kind, project_root)?;
             let target_path = resolve_target_path(&file.path, &target_dir)?;
+            debug!(
+                "Target: {} -> {} (provider={})",
+                source_path.display(),
+                target_path.display(),
+                provider
+            );
 
             if !dry_run {
                 if let Some(parent) = target_path.parent() {
@@ -65,6 +91,11 @@ pub(crate) fn install(
                 // Place the file
                 match file.strategy {
                     FileStrategy::Copy => {
+                        debug!(
+                            "Copying {} -> {}",
+                            source_path.display(),
+                            target_path.display()
+                        );
                         if source_path.is_dir() {
                             copy_dir_recursive(&source_path, &target_path)?;
                         } else {
@@ -78,6 +109,11 @@ pub(crate) fn install(
                         }
                     }
                     FileStrategy::Link => {
+                        debug!(
+                            "Symlinking {} -> {}",
+                            source_path.display(),
+                            target_path.display()
+                        );
                         if target_path.exists() || target_path.is_symlink() {
                             if target_path.is_dir() && !target_path.is_symlink() {
                                 fs::remove_dir_all(&target_path)?;
@@ -155,6 +191,7 @@ fn resolve_target_path(relative_path: &Path, target_dir: &Path) -> Result<std::p
 
 /// Recursively copy a directory, skipping symlinks to avoid infinite loops.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    debug!("Recursively copying {} -> {}", src.display(), dst.display());
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -163,6 +200,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let dst_path = dst.join(entry.file_name());
 
         if file_type.is_symlink() {
+            debug!("Skipping symlink: {}", src_path.display());
             // Skip symlinks to prevent infinite recursion from directory loops
             continue;
         } else if file_type.is_dir() {
@@ -407,5 +445,73 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dry_run_does_not_create_files() -> Result<()> {
+        let src_dir = TempDir::new()?;
+        let dst_dir = TempDir::new()?;
+
+        let skill_dir = src_dir.path().join("skills").join("review");
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(skill_dir.join("SKILL.md"), "# Review")?;
+
+        let files = vec![FileMapping {
+            path: PathBuf::from("skills/review"),
+            kind: FileKind::Skill,
+            strategy: FileStrategy::Copy,
+        }];
+
+        let results = install(
+            &files,
+            &[AgentProvider::ClaudeCode],
+            &FileScope::Project,
+            dst_dir.path(),
+            src_dir.path(),
+            true, // dry_run
+        )?;
+
+        assert_eq!(results.len(), 1);
+        // No actual files should be created
+        assert!(!dst_dir.path().join(".claude").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_skips_symlinks() -> Result<()> {
+        let src_dir = TempDir::new()?;
+        let dst_dir = TempDir::new()?;
+
+        let skill = src_dir.path().join("my-skill");
+        fs::create_dir_all(&skill)?;
+        fs::write(skill.join("SKILL.md"), "# Skill")?;
+        // Create a symlink inside the skill dir
+        std::os::unix::fs::symlink("/dev/null", skill.join("bad-link"))?;
+
+        let target = dst_dir.path().join("my-skill");
+        copy_dir_recursive(&skill, &target)?;
+
+        assert!(target.join("SKILL.md").exists());
+        assert!(!target.join("bad-link").exists()); // symlink should be skipped
+        Ok(())
+    }
+
+    #[test]
+    fn install_empty_files_list() -> Result<()> {
+        let src_dir = TempDir::new()?;
+        let dst_dir = TempDir::new()?;
+
+        let results = install(
+            &[],
+            &[AgentProvider::ClaudeCode],
+            &FileScope::Project,
+            dst_dir.path(),
+            src_dir.path(),
+            false,
+        )?;
+
+        assert!(results.is_empty());
+        Ok(())
     }
 }

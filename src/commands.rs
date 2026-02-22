@@ -1,14 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use log::debug;
 
 use crate::manifest::{Dependency, FileMapping};
 use crate::types::{AgentProvider, FileKind, FileScope, FileStrategy};
 use crate::{git, installer, manifest, scanner};
-
-// ---------------------------------------------------------------------------
-// Install command
-// ---------------------------------------------------------------------------
 
 /// Options for the install command, collected from CLI arguments.
 pub struct InstallOptions {
@@ -29,6 +26,10 @@ pub struct InstallOptions {
 /// - **With source**: resolves the source, scans it for agent files, installs
 ///   them, and (unless `no_save` is set) adds the source to `agentfiles.json`.
 pub fn cmd_install(opts: InstallOptions) -> Result<()> {
+    debug!(
+        "cmd_install: source={:?}, scope={}, dry_run={}",
+        opts.source, opts.scope, opts.dry_run
+    );
     let providers = opts
         .providers
         .unwrap_or_else(|| AgentProvider::ALL.to_vec());
@@ -76,6 +77,12 @@ fn install_from_manifest(
     }
 
     let loaded = manifest::load_manifest(project_root)?;
+    debug!(
+        "Loaded manifest '{}' v{} with {} dependencies",
+        loaded.name,
+        loaded.version,
+        loaded.dependencies.len()
+    );
     if loaded.dependencies.is_empty() {
         println!("No dependencies in agentfiles.json. Add one with 'agentfiles install <source>'.");
         return Ok(());
@@ -118,6 +125,7 @@ fn install_from_source(
     no_save: bool,
     dry_run: bool,
 ) -> Result<()> {
+    debug!("Installing from source: {}", source);
     let (source_dir, mut files) = resolve_source(source, None)?;
 
     // Apply pick filter
@@ -126,6 +134,7 @@ fn install_from_source(
         if files.is_empty() {
             anyhow::bail!("no files matched the pick filter");
         }
+        debug!("After pick filter: {} file(s) remaining", files.len());
     }
 
     // Apply strategy override (CLI flag takes highest precedence)
@@ -155,6 +164,7 @@ fn install_dependency(
     dry_run: bool,
 ) -> Result<Vec<installer::InstallResult>> {
     let source = dep.source();
+    debug!("Installing dependency: {}", source);
     println!("  -> {source}");
 
     let (source_dir, mut files) = resolve_source(source, dep.paths())?;
@@ -182,12 +192,13 @@ fn install_dependency(
         return Ok(vec![]);
     }
 
+    debug!(
+        "Dependency '{}': {} file(s) to install",
+        source,
+        files.len()
+    );
     installer::install(&files, providers, scope, project_root, &source_dir, dry_run)
 }
-
-// ---------------------------------------------------------------------------
-// Source resolution
-// ---------------------------------------------------------------------------
 
 /// Resolve a source (remote or local) to a local directory and scanned files.
 ///
@@ -197,6 +208,11 @@ fn resolve_source(
     source: &str,
     custom_paths: Option<&[manifest::PathMapping]>,
 ) -> Result<(PathBuf, Vec<FileMapping>)> {
+    debug!(
+        "Resolving source: {} (is_git={})",
+        source,
+        git::is_git_url(source)
+    );
     if git::is_git_url(source) {
         resolve_remote_source(source, custom_paths)
     } else {
@@ -209,6 +225,7 @@ fn resolve_remote_source(
     source: &str,
     custom_paths: Option<&[manifest::PathMapping]>,
 ) -> Result<(PathBuf, Vec<FileMapping>)> {
+    debug!("Resolving remote source: {}", source);
     let remote = git::parse_remote(source);
 
     let ref_display = remote
@@ -237,6 +254,7 @@ fn resolve_local_source(
     source: &str,
     custom_paths: Option<&[manifest::PathMapping]>,
 ) -> Result<(PathBuf, Vec<FileMapping>)> {
+    debug!("Resolving local source: {}", source);
     let path = PathBuf::from(source);
     if !path.exists() {
         anyhow::bail!("source path not found: {}", path.display());
@@ -254,16 +272,17 @@ fn resolve_local_source(
     if files.is_empty() {
         anyhow::bail!("no agent files found in {}", dir.display());
     }
+    debug!(
+        "Local source resolved: {} file(s) in {}",
+        files.len(),
+        dir.display()
+    );
 
     let canonical = dir
         .canonicalize()
         .context("could not resolve source path")?;
     Ok((canonical, files))
 }
-
-// ---------------------------------------------------------------------------
-// Manifest auto-save
-// ---------------------------------------------------------------------------
 
 /// Add a dependency to agentfiles.json, creating the file if it doesn't exist.
 ///
@@ -274,6 +293,7 @@ fn save_dependency(
     pick: Option<&[String]>,
     project_root: &std::path::Path,
 ) -> Result<()> {
+    debug!("Saving dependency: {}", source);
     let manifest_path = project_root.join("agentfiles.json");
 
     let mut loaded = if manifest_path.is_file() {
@@ -315,10 +335,6 @@ fn save_dependency(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Output
-// ---------------------------------------------------------------------------
-
 fn print_results(results: &[installer::InstallResult], dry_run: bool) {
     let prefix = if dry_run { "[dry-run] " } else { "" };
 
@@ -344,11 +360,8 @@ fn print_results(results: &[installer::InstallResult], dry_run: bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Init command
-// ---------------------------------------------------------------------------
-
 pub fn cmd_init(path: PathBuf, name: Option<String>) -> Result<()> {
+    debug!("cmd_init: path={}, name={:?}", path.display(), name);
     let dir = if path.is_dir() {
         path.clone()
     } else {
@@ -378,11 +391,8 @@ pub fn cmd_init(path: PathBuf, name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Scan command
-// ---------------------------------------------------------------------------
-
 pub fn cmd_scan(source: String) -> Result<()> {
+    debug!("cmd_scan: source={}", source);
     let files = if git::is_git_url(&source) {
         let remote = git::parse_remote(&source);
 
@@ -414,10 +424,6 @@ pub fn cmd_scan(source: String) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Remove command
-// ---------------------------------------------------------------------------
-
 pub fn cmd_remove(
     source: String,
     clean: bool,
@@ -425,6 +431,7 @@ pub fn cmd_remove(
     providers: Option<Vec<AgentProvider>>,
     root: PathBuf,
 ) -> Result<()> {
+    debug!("cmd_remove: source={}, clean={}", source, clean);
     let project_root = root
         .canonicalize()
         .context("could not resolve project root")?;
@@ -459,6 +466,7 @@ fn clean_installed_files(
     providers: &[AgentProvider],
     scope: &FileScope,
 ) -> Result<()> {
+    debug!("Cleaning installed files for source: {}", source);
     // Resolve the source to get the file mappings
     let scan_result = resolve_source(source, None);
 
@@ -489,6 +497,7 @@ fn clean_installed_files(
 
             let target_path = target_dir.join(file_name);
             if target_path.exists() || target_path.is_symlink() {
+                debug!("Removing {}", target_path.display());
                 if target_path.is_dir() && !target_path.is_symlink() {
                     std::fs::remove_dir_all(&target_path)
                         .with_context(|| format!("failed to remove {}", target_path.display()))?;
@@ -509,11 +518,8 @@ fn clean_installed_files(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// List command
-// ---------------------------------------------------------------------------
-
 pub fn cmd_list(root: PathBuf) -> Result<()> {
+    debug!("cmd_list: root={}", root.display());
     let project_root = root
         .canonicalize()
         .context("could not resolve project root")?;
@@ -567,10 +573,6 @@ pub fn cmd_list(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Matrix command
-// ---------------------------------------------------------------------------
-
 pub fn cmd_matrix() -> Result<()> {
     let kinds = [FileKind::Skill, FileKind::Command, FileKind::Agent];
     let providers = AgentProvider::ALL;
@@ -612,10 +614,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // -----------------------------------------------------------------------
-    // Scan command tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn scan_local_with_files() -> Result<()> {
         let dir = TempDir::new()?;
@@ -645,10 +643,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // Init command tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn init_creates_empty_manifest() -> Result<()> {
         let dir = TempDir::new()?;
@@ -672,10 +666,6 @@ mod tests {
         assert!(result.is_err());
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Install from manifest tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn install_no_source_without_manifest_errors() {
@@ -713,10 +703,6 @@ mod tests {
         assert!(result.is_ok());
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Auto-save tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn install_source_auto_saves_to_manifest() -> Result<()> {

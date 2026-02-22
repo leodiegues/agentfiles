@@ -1,14 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::types::{FileKind, FileStrategy};
-
-// ---------------------------------------------------------------------------
-// Internal types (scanner output / installer input)
-// ---------------------------------------------------------------------------
 
 /// A single discovered agent file used by the scanner and installer.
 ///
@@ -25,10 +22,6 @@ pub(crate) struct FileMapping {
     /// How to place the file at the target. Defaults to Copy.
     pub strategy: FileStrategy,
 }
-
-// ---------------------------------------------------------------------------
-// Dependency types (serialized in agentfiles.json)
-// ---------------------------------------------------------------------------
 
 /// A dependency source -- either a simple URL/path string or a detailed spec.
 ///
@@ -120,10 +113,6 @@ pub struct PathMapping {
     pub kind: FileKind,
 }
 
-// ---------------------------------------------------------------------------
-// Manifest
-// ---------------------------------------------------------------------------
-
 /// The agentfiles.json project manifest.
 ///
 /// Lists dependencies (remote or local sources) that provide agent files.
@@ -201,8 +190,10 @@ impl Manifest {
     pub fn add_dependency(&mut self, dep: Dependency) -> bool {
         let source = dep.source().to_string();
         if self.has_dependency(&source) {
+            debug!("Dependency already exists: {}", source);
             return false;
         }
+        debug!("Adding dependency: {}", source);
         self.dependencies.push(dep);
         true
     }
@@ -222,6 +213,7 @@ impl Manifest {
     ///
     /// Uses normalized URL comparison, same as `has_dependency`.
     pub fn remove_dependency(&mut self, source: &str) -> bool {
+        debug!("Removing dependency: {}", source);
         let normalized = git::normalize_source(source);
         let before = self.dependencies.len();
         self.dependencies
@@ -234,6 +226,7 @@ impl Manifest {
 ///
 /// If `path` is a directory, looks for `agentfiles.json` inside it.
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
+    debug!("Loading manifest from {}", path.display());
     if path.is_dir() {
         return load_manifest(&path.join("agentfiles.json"));
     }
@@ -246,6 +239,7 @@ pub fn load_manifest(path: &Path) -> Result<Manifest> {
 /// Returns the full path of the written file.
 /// Errors if `path` points to an existing file.
 pub fn save_manifest(manifest: &Manifest, path: &Path) -> Result<PathBuf> {
+    debug!("Saving manifest to {}", path.display());
     if path.is_file() {
         bail!("cannot save manifest to a file, provide a directory path.");
     }
