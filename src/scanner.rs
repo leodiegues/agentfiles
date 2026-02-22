@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use log::debug;
 
 use crate::manifest::{FileMapping, PathMapping};
 use crate::types::{AgentProvider, FileKind, FileStrategy};
@@ -12,10 +13,6 @@ const KIND_DIRS: &[(&str, FileKind)] = &[
     ("commands", FileKind::Command),
     ("agents", FileKind::Agent),
 ];
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Scan a directory for agent files and return discovered file mappings.
 ///
@@ -38,15 +35,22 @@ pub(crate) fn scan_agent_files(
         .canonicalize()
         .with_context(|| format!("cannot resolve path: {}", root.display()))?;
 
+    debug!("Scanning agent files in {}", root.display());
     let mut mappings = Vec::new();
 
     if let Some(paths) = custom_paths {
+        debug!("Using {} custom path mapping(s)", paths.len());
         scan_custom_paths(&root, paths, &mut mappings)?;
     } else {
+        debug!("Using default convention scanning");
         scan_default_convention(&root, &mut mappings)?;
     }
 
     deduplicate(&mut mappings);
+    debug!(
+        "Scan complete: {} mapping(s) after deduplication",
+        mappings.len()
+    );
 
     Ok(mappings)
 }
@@ -56,6 +60,11 @@ pub(crate) fn scan_agent_files(
 /// Pick items can be kind-prefixed (`"skills/review"`, `"commands/deploy"`)
 /// or plain names (`"review"`). A plain name matches any kind.
 pub(crate) fn filter_by_pick(mappings: Vec<FileMapping>, pick: &[String]) -> Vec<FileMapping> {
+    debug!(
+        "Filtering {} mapping(s) by {} pick item(s)",
+        mappings.len(),
+        pick.len()
+    );
     mappings
         .into_iter()
         .filter(|m| {
@@ -85,16 +94,13 @@ pub(crate) fn infer_name(path: &Path) -> String {
         .unwrap_or_else(|| "unnamed".to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Default convention scanning
-// ---------------------------------------------------------------------------
-
 /// Scan using the default convention: provider-prefixed dirs + bare kind dirs.
 fn scan_default_convention(root: &Path, mappings: &mut Vec<FileMapping>) -> Result<()> {
     // Scan known provider-prefixed directories (derived from provider layouts)
     for prefix in AgentProvider::PROJECT_BASES {
         let prefix_dir = root.join(prefix);
         if prefix_dir.is_dir() {
+            debug!("Checking provider prefix: {}", prefix_dir.display());
             scan_kind_dirs(root, &prefix_dir, mappings)?;
         }
     }
@@ -103,6 +109,7 @@ fn scan_default_convention(root: &Path, mappings: &mut Vec<FileMapping>) -> Resu
     for &(kind_name, ref kind) in KIND_DIRS {
         let kind_dir = root.join(kind_name);
         if kind_dir.is_dir() {
+            debug!("Checking bare kind directory: {}", kind_dir.display());
             scan_kind_dir(root, &kind_dir, kind, mappings)?;
         }
     }
@@ -132,8 +139,12 @@ fn scan_kind_dir(
     kind: &FileKind,
     mappings: &mut Vec<FileMapping>,
 ) -> Result<()> {
-    let entries = fs::read_dir(kind_dir)
-        .with_context(|| format!("cannot read directory: {}", kind_dir.display()))?;
+    debug!("Scanning {} for {}", kind_dir.display(), kind);
+    let entries: Vec<_> = fs::read_dir(kind_dir)
+        .with_context(|| format!("cannot read directory: {}", kind_dir.display()))?
+        .collect();
+
+    debug!("Found {} entries in {}", entries.len(), kind_dir.display());
 
     for entry in entries {
         let entry = entry?;
@@ -141,8 +152,6 @@ fn scan_kind_dir(
 
         match kind {
             FileKind::Skill => {
-                // Skills are directories containing SKILL.md.
-                // We record the directory path so the entire skill dir is installed.
                 if entry_path.is_dir() {
                     let skill_md = entry_path.join("SKILL.md");
                     if skill_md.is_file() {
@@ -150,12 +159,16 @@ fn scan_kind_dir(
                             .strip_prefix(root)
                             .unwrap_or(&entry_path)
                             .to_path_buf();
+                        debug!("Found skill: {}", rel_path.display());
                         mappings.push(FileMapping {
                             path: rel_path,
                             kind: FileKind::Skill,
                             strategy: FileStrategy::Copy,
                         });
+                        continue;
                     }
+                    debug!("No SKILL.md in {}, recursing", entry_path.display());
+                    scan_kind_dir(root, &entry_path, kind, mappings)?;
                 }
             }
             FileKind::Command | FileKind::Agent => {
@@ -168,22 +181,24 @@ fn scan_kind_dir(
                         .strip_prefix(root)
                         .unwrap_or(&entry_path)
                         .to_path_buf();
+                    debug!("Found {}: {}", kind, rel_path.display());
                     mappings.push(FileMapping {
                         path: rel_path,
                         kind: *kind,
                         strategy: FileStrategy::Copy,
                     });
+                    continue;
                 }
+                if entry_path.is_dir() {
+                    debug!("Recursing into {} for {}", entry_path.display(), kind);
+                }
+                scan_kind_dir(root, &entry_path, kind, mappings)?;
             }
         }
     }
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Custom path scanning
-// ---------------------------------------------------------------------------
 
 /// Scan custom path mappings. Each entry maps a relative path to a file kind.
 /// Directories are scanned using the standard kind convention. Files are
@@ -197,16 +212,15 @@ fn scan_custom_paths(
         let full_path = root.join(&mapping.path);
 
         if !full_path.exists() {
-            // Skip paths that don't exist -- the source may not have all
-            // configured paths.
+            debug!("Skipping non-existent path: {}", full_path.display());
             continue;
         }
 
         if full_path.is_dir() {
-            // Scan directory using the standard convention for this kind
+            debug!("Scanning directory: {}", full_path.display());
             scan_kind_dir(root, &full_path, &mapping.kind, mappings)?;
         } else if full_path.is_file() {
-            // Single file -- add directly
+            debug!("Adding file: {}", full_path.display());
             let rel_path = full_path
                 .strip_prefix(root)
                 .unwrap_or(&full_path)
@@ -222,15 +236,12 @@ fn scan_custom_paths(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Deduplication
-// ---------------------------------------------------------------------------
-
 /// Deduplicate file mappings by their name + kind.
 ///
 /// If the same skill/command/agent name appears from multiple provider
 /// directories, keep only the first occurrence.
 fn deduplicate(mappings: &mut Vec<FileMapping>) {
+    debug!("Deduplicating {} mapping(s)", mappings.len());
     let mut seen = std::collections::HashSet::new();
     mappings.retain(|m| {
         let stem = m.path.file_stem().unwrap_or_default().to_string_lossy();
@@ -273,10 +284,6 @@ mod tests {
         )
         .unwrap();
     }
-
-    // -----------------------------------------------------------------------
-    // Default convention tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn scans_claude_skills() -> Result<()> {
@@ -364,10 +371,6 @@ mod tests {
         assert!(mappings.is_empty());
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Custom path tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn custom_paths_scan_directory() -> Result<()> {
@@ -463,10 +466,6 @@ mod tests {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Pick filter tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn filter_by_plain_name() {
         let mappings = vec![
@@ -531,14 +530,173 @@ mod tests {
         assert_eq!(filtered.len(), 2);
     }
 
-    // -----------------------------------------------------------------------
-    // Infer name
-    // -----------------------------------------------------------------------
-
     #[test]
     fn infer_name_from_path() {
         assert_eq!(infer_name(Path::new("/home/user/my-project")), "my-project");
         assert_eq!(infer_name(Path::new("/")), "unnamed");
         assert_eq!(infer_name(Path::new("some-folder")), "some-folder");
+    }
+
+    #[test]
+    fn scans_deeply_nested_skills() -> Result<()> {
+        let dir = TempDir::new()?;
+        let deep = dir
+            .path()
+            .join("skills")
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("deep-skill");
+        fs::create_dir_all(&deep)?;
+        fs::write(deep.join("SKILL.md"), "# Deep skill")?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].kind, FileKind::Skill);
+        assert!(mappings[0].path.to_string_lossy().contains("deep-skill"));
+        Ok(())
+    }
+
+    #[test]
+    fn scans_deeply_nested_commands() -> Result<()> {
+        let dir = TempDir::new()?;
+        let nested = dir
+            .path()
+            .join("commands")
+            .join("category")
+            .join("subcategory");
+        fs::create_dir_all(&nested)?;
+        fs::write(nested.join("deploy.md"), "# Deploy")?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].kind, FileKind::Command);
+        Ok(())
+    }
+
+    #[test]
+    fn only_md_files_become_commands() -> Result<()> {
+        let dir = TempDir::new()?;
+        let cmd_dir = dir.path().join("commands");
+        fs::create_dir_all(&cmd_dir)?;
+        fs::write(cmd_dir.join("deploy.md"), "# Deploy")?;
+        fs::write(cmd_dir.join("review.md"), "# Review")?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 2);
+        for m in &mappings {
+            assert_eq!(m.kind, FileKind::Command);
+            assert!(m.path.to_string_lossy().ends_with(".md"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skips_skill_dir_without_skill_md() -> Result<()> {
+        let dir = TempDir::new()?;
+        let skill_dir = dir.path().join("skills").join("incomplete");
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(skill_dir.join("README.md"), "# Not a skill")?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert!(mappings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_kind_dirs_return_empty() -> Result<()> {
+        let dir = TempDir::new()?;
+        fs::create_dir_all(dir.path().join("skills"))?;
+        fs::create_dir_all(dir.path().join("commands"))?;
+        fs::create_dir_all(dir.path().join("agents"))?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert!(mappings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_kinds_across_providers_and_bare() -> Result<()> {
+        let dir = TempDir::new()?;
+        setup_skill(dir.path(), ".claude", "review");
+        setup_command(dir.path(), ".opencode", "deploy");
+        setup_agent(dir.path(), "", "security");
+        setup_skill(dir.path(), "", "lint");
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 4);
+
+        let skill_count = mappings
+            .iter()
+            .filter(|m| m.kind == FileKind::Skill)
+            .count();
+        let cmd_count = mappings
+            .iter()
+            .filter(|m| m.kind == FileKind::Command)
+            .count();
+        let agent_count = mappings
+            .iter()
+            .filter(|m| m.kind == FileKind::Agent)
+            .count();
+        assert_eq!(skill_count, 2);
+        assert_eq!(cmd_count, 1);
+        assert_eq!(agent_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dedup_prefers_first_occurrence() -> Result<()> {
+        let dir = TempDir::new()?;
+        setup_skill(dir.path(), ".claude", "review");
+        setup_skill(dir.path(), "", "review");
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 1);
+        // Provider-prefixed dirs are scanned first, so .claude/skills/review wins
+        assert!(mappings[0].path.to_string_lossy().contains(".claude"));
+        Ok(())
+    }
+
+    #[test]
+    fn scans_sibling_skills_at_different_depths() -> Result<()> {
+        let dir = TempDir::new()?;
+        // Shallow skill
+        let shallow = dir.path().join("skills").join("shallow-skill");
+        fs::create_dir_all(&shallow)?;
+        fs::write(shallow.join("SKILL.md"), "# Shallow")?;
+
+        // Deep skill
+        let deep = dir
+            .path()
+            .join("skills")
+            .join("category")
+            .join("deep-skill");
+        fs::create_dir_all(&deep)?;
+        fs::write(deep.join("SKILL.md"), "# Deep")?;
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 2);
+        let names: Vec<String> = mappings
+            .iter()
+            .map(|m| m.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"shallow-skill".to_string()));
+        assert!(names.contains(&"deep-skill".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_defaults_strategy_to_copy() -> Result<()> {
+        let dir = TempDir::new()?;
+        setup_skill(dir.path(), ".claude", "s1");
+        setup_command(dir.path(), ".claude", "c1");
+        setup_agent(dir.path(), ".claude", "a1");
+
+        let mappings = scan_agent_files(dir.path(), None)?;
+        assert_eq!(mappings.len(), 3);
+        for m in &mappings {
+            assert_eq!(m.strategy, FileStrategy::Copy);
+        }
+        Ok(())
     }
 }

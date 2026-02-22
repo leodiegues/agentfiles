@@ -3,6 +3,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+use log::debug;
 
 /// Result of resolving a remote git source.
 ///
@@ -111,22 +112,30 @@ pub fn parse_remote(input: &str) -> ParsedRemote {
 ///
 /// If a `git_ref` is provided, checks out that ref after clone/fetch.
 pub fn resolve_remote(remote: &ParsedRemote) -> Result<GitSource> {
+    debug!(
+        "Resolving remote: url={}, ref={:?}",
+        remote.url, remote.git_ref
+    );
     ensure_git_available()?;
 
     let cache_dir = get_cache_dir(&remote.url)?;
 
     if cache_dir.exists() {
+        debug!("Cache hit, fetching updates: {}", cache_dir.display());
         // Update existing clone
         fetch_repo(&cache_dir)?;
     } else {
+        debug!("Cache miss, cloning to: {}", cache_dir.display());
         // Fresh clone
         clone_repo(&remote.url, &cache_dir)?;
     }
 
     // Check out the requested ref, or reset to the default branch HEAD
     if let Some(ref git_ref) = remote.git_ref {
+        debug!("Checking out ref: {}", git_ref);
         checkout_ref(&cache_dir, git_ref)?;
     } else {
+        debug!("Resetting to default branch");
         reset_to_default_branch(&cache_dir)?;
     }
 
@@ -228,6 +237,7 @@ fn ensure_git_available() -> Result<()> {
 
 /// Clone a repository into the cache directory.
 fn clone_repo(url: &str, target: &Path) -> Result<()> {
+    debug!("Cloning {} into {}", url, target.display());
     // Ensure parent directory exists
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -250,6 +260,7 @@ fn clone_repo(url: &str, target: &Path) -> Result<()> {
 
 /// Fetch updates in an existing clone.
 fn fetch_repo(repo_dir: &Path) -> Result<()> {
+    debug!("Fetching updates in {}", repo_dir.display());
     let output = Command::new("git")
         .args(["fetch", "--all", "--prune"])
         .current_dir(repo_dir)
@@ -286,6 +297,7 @@ fn validate_git_ref(git_ref: &str) -> Result<()> {
 
 /// Check out a specific ref (branch, tag, or commit hash).
 fn checkout_ref(repo_dir: &Path, git_ref: &str) -> Result<()> {
+    debug!("Checking out ref '{}' in {}", git_ref, repo_dir.display());
     validate_git_ref(git_ref)?;
 
     // First, try a detached checkout (works for tags and commit hashes)
@@ -317,6 +329,7 @@ fn checkout_ref(repo_dir: &Path, git_ref: &str) -> Result<()> {
 
 /// Reset the working tree to the latest commit on the default branch.
 fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
+    debug!("Resetting to default branch in {}", repo_dir.display());
     // Get the default branch name from the remote HEAD
     let output = Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
@@ -330,6 +343,7 @@ fn reset_to_default_branch(repo_dir: &Path) -> Result<()> {
     } else {
         "main".to_string()
     };
+    debug!("Default branch: {}", branch);
 
     let output = Command::new("git")
         .args(["checkout", &branch])

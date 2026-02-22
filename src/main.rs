@@ -5,6 +5,12 @@ use clap::Parser;
 fn main() -> Result<()> {
     let args = cli::Cli::parse();
 
+    if args.verbose {
+        unsafe { std::env::set_var("RUST_LOG", "debug") };
+    }
+
+    env_logger::init();
+
     match args.command {
         cli::Command::Install {
             source,

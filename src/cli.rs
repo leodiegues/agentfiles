@@ -11,6 +11,9 @@ use crate::types::{AgentProvider, FileScope, FileStrategy};
     version
 )]
 pub struct Cli {
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
